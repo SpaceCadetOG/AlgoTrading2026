@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -95,6 +96,26 @@ func main() {
 	if err := research.WriteChapter6RiskSummaryJSON(riskSummaryPath, riskSummary); err != nil {
 		log.Fatalf("write chapter 6 risk summary: %v", err)
 	}
+	filterDecisions := research.EvaluateChapter6RiskFilters(riskRows, riskmetrics.DefaultRiskFilterConfig())
+	filterCSVPath := "research/chapter6_risk_filters.csv"
+	if err := research.WriteChapter6RiskFiltersCSV(filterCSVPath, filterDecisions); err != nil {
+		log.Fatalf("write chapter 6 risk filters: %v", err)
+	}
+	filterSummary := research.NewChapter6RiskFilterSummary(filterDecisions)
+	filterSummaryPath := "research/chapter6_risk_filters_summary.json"
+	if err := research.WriteChapter6RiskFilterSummaryJSON(filterSummaryPath, filterSummary); err != nil {
+		log.Fatalf("write chapter 6 risk filter summary: %v", err)
+	}
+	riskRankings := research.BuildChapter6RiskRanking(riskRows, filterDecisions)
+	rankingCSVPath := "research/chapter6_risk_ranking.csv"
+	if err := research.WriteChapter6RiskRankingCSV(rankingCSVPath, riskRankings); err != nil {
+		log.Fatalf("write chapter 6 risk ranking: %v", err)
+	}
+	rankingSummary := research.NewChapter6RiskRankingSummary(riskRankings)
+	rankingSummaryPath := "research/chapter6_risk_ranking_summary.json"
+	if err := research.WriteChapter6RiskRankingSummaryJSON(rankingSummaryPath, rankingSummary); err != nil {
+		log.Fatalf("write chapter 6 risk ranking summary: %v", err)
+	}
 
 	summary := buildSummary(
 		len(primary.Candles),
@@ -155,6 +176,38 @@ func main() {
 	fmt.Println()
 	fmt.Println("wrote " + riskMetricsPath)
 	fmt.Println("wrote " + riskSummaryPath)
+	fmt.Println()
+	fmt.Println("=== CHAPTER 6 RISK FILTERS ===")
+	fmt.Println()
+	fmt.Println("strategy decision reasons")
+	for _, decision := range filterDecisions {
+		fmt.Printf(
+			"%s %s %s\n",
+			decision.Strategy,
+			decision.Decision,
+			strings.Join(decision.Reasons, ","),
+		)
+	}
+	fmt.Println()
+	fmt.Println("wrote " + filterCSVPath)
+	fmt.Println("wrote " + filterSummaryPath)
+	fmt.Println()
+	fmt.Println("=== CHAPTER 6 RISK RANKING ===")
+	fmt.Println()
+	fmt.Println("rank strategy decision score reasons")
+	for _, row := range riskRankings {
+		fmt.Printf(
+			"%d %s %s %.2f %s\n",
+			row.Rank,
+			row.Strategy,
+			row.Decision,
+			row.Score,
+			strings.Join(row.Reasons, ","),
+		)
+	}
+	fmt.Println()
+	fmt.Println("wrote " + rankingCSVPath)
+	fmt.Println("wrote " + rankingSummaryPath)
 
 	_ = chapter4VenueRows
 	_ = chapter4VenueAnalyses
