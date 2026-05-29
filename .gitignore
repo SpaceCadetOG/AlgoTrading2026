@@ -1,0 +1,25 @@
+﻿# secrets
+.env
+.env.*
+
+# logs
+*.log
+
+# research outputs
+research/*.csv
+research/*.json
+
+# caches
+data/cache/*
+
+# binaries
+*.exe
+*.out
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
