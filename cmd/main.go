@@ -30,6 +30,7 @@ import (
 	chapter4 "AlgoTrading2026/strategies/chapter4"
 	chapter5 "AlgoTrading2026/strategies/chapter5"
 	"AlgoTrading2026/strategy"
+	"AlgoTrading2026/system"
 	"AlgoTrading2026/volatility"
 )
 
@@ -115,6 +116,25 @@ func main() {
 	rankingSummaryPath := "research/chapter6_risk_ranking_summary.json"
 	if err := research.WriteChapter6RiskRankingSummaryJSON(rankingSummaryPath, rankingSummary); err != nil {
 		log.Fatalf("write chapter 6 risk ranking summary: %v", err)
+	}
+	promotionGates := research.BuildChapter6PromotionGates(riskRankings, riskmetrics.DefaultPromotionConfig())
+	promotionCSVPath := "research/chapter6_promotion_gates.csv"
+	if err := research.WriteChapter6PromotionGatesCSV(promotionCSVPath, promotionGates); err != nil {
+		log.Fatalf("write chapter 6 promotion gates: %v", err)
+	}
+	promotionSummary := research.NewChapter6PromotionGatesSummary(promotionGates)
+	promotionSummaryPath := "research/chapter6_promotion_gates_summary.json"
+	if err := research.WriteChapter6PromotionGatesSummaryJSON(promotionSummaryPath, promotionSummary); err != nil {
+		log.Fatalf("write chapter 6 promotion gates summary: %v", err)
+	}
+	chapter6Packet := research.BuildChapter6RiskPacket(riskRankings, promotionGates)
+	packetJSONPath := "research/chapter6_packet.json"
+	if err := research.WriteChapter6RiskPacketJSON(packetJSONPath, chapter6Packet); err != nil {
+		log.Fatalf("write chapter 6 packet json: %v", err)
+	}
+	packetMarkdownPath := "research/chapter6_packet.md"
+	if err := research.WriteChapter6RiskPacketMarkdown(packetMarkdownPath, chapter6Packet); err != nil {
+		log.Fatalf("write chapter 6 packet markdown: %v", err)
 	}
 
 	summary := buildSummary(
@@ -208,6 +228,159 @@ func main() {
 	fmt.Println()
 	fmt.Println("wrote " + rankingCSVPath)
 	fmt.Println("wrote " + rankingSummaryPath)
+	fmt.Println()
+	fmt.Println("=== CHAPTER 6 PROMOTION GATES ===")
+	fmt.Println()
+	fmt.Println("rank strategy gate reasons")
+	for _, gate := range promotionGates {
+		fmt.Printf(
+			"%d %s %s %s\n",
+			gate.Rank,
+			gate.Strategy,
+			gate.Gate,
+			strings.Join(gate.Reasons, ","),
+		)
+	}
+	fmt.Println()
+	fmt.Println("wrote " + promotionCSVPath)
+	fmt.Println("wrote " + promotionSummaryPath)
+	fmt.Println()
+	fmt.Println("=== CHAPTER 6 FINAL RISK PACKET ===")
+	fmt.Println()
+	fmt.Printf("bestRiskAdjusted=%d\n", len(chapter6Packet.BestRiskAdjustedStrategies))
+	fmt.Printf("keptThrottled=%d\n", len(chapter6Packet.KeptThrottled))
+	fmt.Printf("rewriteRequired=%d\n", len(chapter6Packet.RewriteRequired))
+	fmt.Printf("removedFromCandidates=%d\n", len(chapter6Packet.RemovedFromCandidates))
+	fmt.Println("conclusion=No strategy is promoted to active/paper execution yet.")
+	fmt.Println("next=" + chapter6Packet.NextRecommendedPhase)
+	fmt.Println()
+	fmt.Println("wrote " + packetJSONPath)
+	fmt.Println("wrote " + packetMarkdownPath)
+	fmt.Println()
+	fmt.Println("=== CHAPTER 7B TRADING SYSTEM SIMULATION ===")
+	chapter7Summary := system.NewTestTradingSimulation(16).RunArbitrageExample()
+	fmt.Printf(
+		"order=%s status=%s pnl=%.2f bid=%.2f ask=%.2f auditEvents=%d\n",
+		chapter7Summary.OrderID,
+		chapter7Summary.OrderStatus,
+		chapter7Summary.RealizedPnL,
+		chapter7Summary.BookBestBid,
+		chapter7Summary.BookBestAsk,
+		chapter7Summary.AuditEvents,
+	)
+	fmt.Println("wrote research/chapter7_architecture.md")
+	fmt.Println()
+	fmt.Println("=== CHAPTER 7C COMMAND CONTROL SERVICES ===")
+	supervisor := system.NewChapter7Supervisor()
+	control := system.NewCommandControl(supervisor)
+	control.Handle(system.CommandStart)
+	control.Handle(system.CommandPause)
+	control.Handle(system.CommandResume)
+	control.Handle(system.CommandStatus)
+	fmt.Printf(
+		"state=%s services=%d running=%d auditEntries=%d\n",
+		control.State(),
+		supervisor.ServiceCount(),
+		supervisor.CountByStatus(system.ServiceRunning),
+		len(control.AuditLog()),
+	)
+	chapter7Packet := research.BuildChapter7Packet()
+	chapter7PacketJSONPath := "research/chapter7_packet.json"
+	if err := research.WriteChapter7PacketJSON(chapter7PacketJSONPath, chapter7Packet); err != nil {
+		log.Fatalf("write chapter 7 packet json: %v", err)
+	}
+	chapter7PacketMarkdownPath := "research/chapter7_packet.md"
+	if err := research.WriteChapter7PacketMarkdown(chapter7PacketMarkdownPath, chapter7Packet); err != nil {
+		log.Fatalf("write chapter 7 packet markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 7D FINAL TRADING SYSTEM PACKET ===")
+	fmt.Printf("components=%d critical=%d nonCritical=%d gaps=%d\n",
+		len(chapter7Packet.ImplementedComponents),
+		len(chapter7Packet.CriticalComponents),
+		len(chapter7Packet.NonCriticalComponents),
+		len(chapter7Packet.RemainingGaps),
+	)
+	fmt.Println("conclusion=Chapter 7 trading-system skeleton is complete.")
+	fmt.Println("readiness=" + chapter7Packet.ReadinessForChapter8)
+	fmt.Println("wrote " + chapter7PacketJSONPath)
+	fmt.Println("wrote " + chapter7PacketMarkdownPath)
+	chapter8Audit := research.BuildChapter8GatewayAudit()
+	chapter8AuditJSONPath := "research/chapter8_gateway_audit.json"
+	if err := research.WriteChapter8GatewayAuditJSON(chapter8AuditJSONPath, chapter8Audit); err != nil {
+		log.Fatalf("write chapter 8 gateway audit json: %v", err)
+	}
+	chapter8AuditMarkdownPath := "research/chapter8_gateway_audit.md"
+	if err := research.WriteChapter8GatewayAuditMarkdown(chapter8AuditMarkdownPath, chapter8Audit); err != nil {
+		log.Fatalf("write chapter 8 gateway audit markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 8B GATEWAY AUDIT ===")
+	fmt.Printf("concepts=%d venues=%d gaps=%d\n", len(chapter8Audit.Concepts), len(chapter8Audit.Venues), len(chapter8Audit.Gaps))
+	fmt.Println("conclusion=" + chapter8Audit.Conclusion)
+	fmt.Println("next=" + chapter8Audit.NextPhase)
+	fmt.Println("wrote " + chapter8AuditJSONPath)
+	fmt.Println("wrote " + chapter8AuditMarkdownPath)
+	chapter8VenueMap := research.BuildChapter8VenueGatewayMap()
+	chapter8VenueMapJSONPath := "research/chapter8_venue_gateway_map.json"
+	if err := research.WriteChapter8VenueGatewayMapJSON(chapter8VenueMapJSONPath, chapter8VenueMap); err != nil {
+		log.Fatalf("write chapter 8 venue gateway map json: %v", err)
+	}
+	chapter8VenueMapMarkdownPath := "research/chapter8_venue_gateway_map.md"
+	if err := research.WriteChapter8VenueGatewayMapMarkdown(chapter8VenueMapMarkdownPath, chapter8VenueMap); err != nil {
+		log.Fatalf("write chapter 8 venue gateway map markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 8C VENUE GATEWAY TRANSLATORS ===")
+	fmt.Printf("translators=%d enabledByDefault=false allowLiveOrders=false\n", len(chapter8VenueMap.Translators))
+	fmt.Println("conclusion=" + chapter8VenueMap.Conclusion)
+	fmt.Println("next=" + chapter8VenueMap.NextPhase)
+	fmt.Println("wrote " + chapter8VenueMapJSONPath)
+	fmt.Println("wrote " + chapter8VenueMapMarkdownPath)
+	chapter8SessionLifecycle := research.BuildChapter8SessionLifecycle()
+	chapter8SessionJSONPath := "research/chapter8_session_lifecycle.json"
+	if err := research.WriteChapter8SessionLifecycleJSON(chapter8SessionJSONPath, chapter8SessionLifecycle); err != nil {
+		log.Fatalf("write chapter 8 session lifecycle json: %v", err)
+	}
+	chapter8SessionMarkdownPath := "research/chapter8_session_lifecycle.md"
+	if err := research.WriteChapter8SessionLifecycleMarkdown(chapter8SessionMarkdownPath, chapter8SessionLifecycle); err != nil {
+		log.Fatalf("write chapter 8 session lifecycle markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 8D GATEWAY SESSION LIFECYCLE ===")
+	fmt.Printf(
+		"sessions=%d heartbeatOK=%d messages=%d errors=%d\n",
+		chapter8SessionLifecycle.Summary.Total,
+		chapter8SessionLifecycle.Summary.HeartbeatOK,
+		chapter8SessionLifecycle.Summary.Messages,
+		chapter8SessionLifecycle.Summary.Errors,
+	)
+	fmt.Println("conclusion=" + chapter8SessionLifecycle.Conclusion)
+	fmt.Println("next=" + chapter8SessionLifecycle.NextPhase)
+	fmt.Println("wrote " + chapter8SessionJSONPath)
+	fmt.Println("wrote " + chapter8SessionMarkdownPath)
+	chapter8Packet := research.BuildChapter8Packet()
+	chapter8PacketJSONPath := "research/chapter8_packet.json"
+	if err := research.WriteChapter8PacketJSON(chapter8PacketJSONPath, chapter8Packet); err != nil {
+		log.Fatalf("write chapter 8 packet json: %v", err)
+	}
+	chapter8PacketMarkdownPath := "research/chapter8_packet.md"
+	if err := research.WriteChapter8PacketMarkdown(chapter8PacketMarkdownPath, chapter8Packet); err != nil {
+		log.Fatalf("write chapter 8 packet markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 8E FINAL EXCHANGE CONNECTIVITY PACKET ===")
+	fmt.Printf(
+		"concepts=%d venues=%d gaps=%d fixItems=%d\n",
+		len(chapter8Packet.ImplementedConcepts),
+		len(chapter8Packet.VenueAPIMapping),
+		len(chapter8Packet.RemainingGaps),
+		len(chapter8Packet.MissingFIXItems),
+	)
+	fmt.Println("conclusion=Chapter 8 exchange connectivity layer is mapped and safely abstracted.")
+	fmt.Println("readiness=" + chapter8Packet.ReadinessForChapter9)
+	fmt.Println("wrote " + chapter8PacketJSONPath)
+	fmt.Println("wrote " + chapter8PacketMarkdownPath)
 
 	_ = chapter4VenueRows
 	_ = chapter4VenueAnalyses
