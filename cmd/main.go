@@ -381,6 +381,119 @@ func main() {
 	fmt.Println("readiness=" + chapter8Packet.ReadinessForChapter9)
 	fmt.Println("wrote " + chapter8PacketJSONPath)
 	fmt.Println("wrote " + chapter8PacketMarkdownPath)
+	inSample, outOfSample := backtest.InSampleOutOfSampleSplit(primary.Candles, backtest.DefaultInSampleRatio)
+	chapter9Assumptions := backtest.DefaultBacktestAssumptions()
+	chapter9Audit := research.BuildChapter9BacktestAudit(len(inSample), len(outOfSample), chapter9Assumptions)
+	chapter9AuditJSONPath := "research/chapter9_backtest_audit.json"
+	if err := research.WriteChapter9BacktestAuditJSON(chapter9AuditJSONPath, chapter9Audit); err != nil {
+		log.Fatalf("write chapter 9 backtest audit json: %v", err)
+	}
+	chapter9AuditMarkdownPath := "research/chapter9_backtest_audit.md"
+	if err := research.WriteChapter9BacktestAuditMarkdown(chapter9AuditMarkdownPath, chapter9Audit); err != nil {
+		log.Fatalf("write chapter 9 backtest audit markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 9B BACKTEST SPLITS AND ASSUMPTIONS ===")
+	fmt.Printf("inSample=%d outOfSample=%d assumptionGaps=%d\n", len(inSample), len(outOfSample), len(chapter9Assumptions.Gaps))
+	fmt.Println("engine=" + chapter9Assumptions.EngineModel)
+	fmt.Println("next=" + chapter9Audit.NextPhase)
+	fmt.Println("wrote " + chapter9AuditJSONPath)
+	fmt.Println("wrote " + chapter9AuditMarkdownPath)
+	chapter9TimeReport := research.BuildChapter9TimeModelReport(len(primary.Candles))
+	chapter9TimeJSONPath := "research/chapter9_time_model.json"
+	if err := research.WriteChapter9TimeModelJSON(chapter9TimeJSONPath, chapter9TimeReport); err != nil {
+		log.Fatalf("write chapter 9 time model json: %v", err)
+	}
+	chapter9TimeMarkdownPath := "research/chapter9_time_model.md"
+	if err := research.WriteChapter9TimeModelMarkdown(chapter9TimeMarkdownPath, chapter9TimeReport); err != nil {
+		log.Fatalf("write chapter 9 time model markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 9C SIMULATED CLOCK ===")
+	fmt.Printf("candles=%d timeGaps=%d\n", len(primary.Candles), len(chapter9TimeReport.RemainingGaps))
+	fmt.Println("clock=deterministic simulated time source")
+	fmt.Println("next=" + chapter9TimeReport.ReadinessForEventBacktest)
+	fmt.Println("wrote " + chapter9TimeJSONPath)
+	fmt.Println("wrote " + chapter9TimeMarkdownPath)
+	eventBacktester := backtest.NewEventDrivenBacktester(backtest.EventDrivenBacktestConfig{
+		Symbol:              primary.Symbol,
+		StartingCash:        10000,
+		MaxCandles:          25,
+		UseSimulatedGateway: true,
+		AllowLiveOrders:     false,
+	})
+	eventResult, err := eventBacktester.Run(primary.Candles)
+	if err != nil {
+		log.Fatalf("run chapter 9 event-driven backtest: %v", err)
+	}
+	chapter9EventReport := research.BuildChapter9EventDrivenReport(eventResult)
+	chapter9EventJSONPath := "research/chapter9_event_driven.json"
+	if err := research.WriteChapter9EventDrivenJSON(chapter9EventJSONPath, chapter9EventReport); err != nil {
+		log.Fatalf("write chapter 9 event-driven json: %v", err)
+	}
+	chapter9EventMarkdownPath := "research/chapter9_event_driven.md"
+	if err := research.WriteChapter9EventDrivenMarkdown(chapter9EventMarkdownPath, chapter9EventReport); err != nil {
+		log.Fatalf("write chapter 9 event-driven markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 9D EVENT-DRIVEN BACKTESTER ===")
+	fmt.Printf(
+		"candles=%d orders=%d fills=%d pnl=%.2f auditEvents=%d\n",
+		eventResult.CandlesProcessed,
+		eventResult.OrdersCreated,
+		eventResult.OrdersFilled,
+		eventResult.FinalPnL,
+		eventResult.AuditEvents,
+	)
+	fmt.Println("clockStart=" + eventResult.ClockStart.Format(time.RFC3339))
+	fmt.Println("clockEnd=" + eventResult.ClockEnd.Format(time.RFC3339))
+	fmt.Println("next=" + chapter9EventReport.NextPhase)
+	fmt.Println("wrote " + chapter9EventJSONPath)
+	fmt.Println("wrote " + chapter9EventMarkdownPath)
+	comparisonResult, err := backtest.CompareForLoopVsEventDriven(
+		primary.Candles,
+		backtest.Config{
+			Venue:           primary.Venue,
+			Symbol:          primary.Symbol,
+			Interval:        ResearchInterval,
+			StartingBalance: 10000,
+			FixedNotional:   100,
+			FeeModel:        backtest.DefaultFeeModel(),
+			SlippageModel:   backtest.DefaultSlippageModel(),
+		},
+		backtest.EventDrivenBacktestConfig{
+			Symbol:              primary.Symbol,
+			StartingCash:        10000,
+			MaxCandles:          25,
+			UseSimulatedGateway: true,
+			AllowLiveOrders:     false,
+		},
+	)
+	if err != nil {
+		log.Fatalf("compare for-loop and event-driven backtesters: %v", err)
+	}
+	chapter9ComparisonReport := research.BuildChapter9BacktesterComparisonReport(comparisonResult)
+	chapter9ComparisonJSONPath := "research/chapter9_backtester_comparison.json"
+	if err := research.WriteChapter9BacktesterComparisonJSON(chapter9ComparisonJSONPath, chapter9ComparisonReport); err != nil {
+		log.Fatalf("write chapter 9 backtester comparison json: %v", err)
+	}
+	chapter9ComparisonMarkdownPath := "research/chapter9_backtester_comparison.md"
+	if err := research.WriteChapter9BacktesterComparisonMarkdown(chapter9ComparisonMarkdownPath, chapter9ComparisonReport); err != nil {
+		log.Fatalf("write chapter 9 backtester comparison markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 9E BACKTESTER COMPARISON ===")
+	fmt.Printf(
+		"candles=%d forLoopTrades=%d eventOrders=%d eventFills=%d pnlDiff=%.2f\n",
+		comparisonResult.Candles,
+		comparisonResult.ForLoopTrades,
+		comparisonResult.EventDrivenOrders,
+		comparisonResult.EventDrivenFills,
+		comparisonResult.PnLDifference,
+	)
+	fmt.Println("recommendation=" + comparisonResult.Recommendation)
+	fmt.Println("wrote " + chapter9ComparisonJSONPath)
+	fmt.Println("wrote " + chapter9ComparisonMarkdownPath)
 
 	_ = chapter4VenueRows
 	_ = chapter4VenueAnalyses
