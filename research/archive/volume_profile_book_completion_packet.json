@@ -1,0 +1,187 @@
+{
+  "status": "complete",
+  "setups": 4,
+  "docs": 3,
+  "tradingStyleMap": [
+    {
+      "name": "intraday",
+      "details": [
+        "daily_session profile",
+        "rolling_3d profile",
+        "VWAP session context",
+        "daily open and failed-auction studies",
+        "latest L2 context for spread and imbalance"
+      ]
+    },
+    {
+      "name": "swing",
+      "details": [
+        "rolling_7d profile",
+        "composite_30d profile",
+        "accumulation and trend setup studies",
+        "setup comparison and quality reviews"
+      ]
+    },
+    {
+      "name": "long-term",
+      "details": [
+        "composite_30d profile",
+        "profile shape study",
+        "major POC/VAH/VAL context",
+        "research-only, no investing strategy implemented"
+      ]
+    }
+  ],
+  "instrumentSelection": [
+    "Liquidity: depth and liquidity near price/VWAP from orderbook and L2 exports.",
+    "Spread: normalized spread percent from the orderbook package.",
+    "Volatility: Chapter 5 volatility metrics and regime reports.",
+    "Data availability: candles, selected trade feeds, L2 snapshots, and L2 recorder outputs.",
+    "Venue reliability: Aster, Hyperliquid, and Lighter market-data availability."
+  ],
+  "marketAnalysisAToZ": [
+    "Price action features identify aggression, initiation, rejection, failed auction, opens, highs, and lows.",
+    "Volume Profile features identify POC, VAH, VAL, HVN, LVN, shape, scoped profiles, and flexible event profiles.",
+    "VWAP features provide session/anchored VWAP, distance, slope, interaction, and context studies.",
+    "L2 context provides spread, depth, imbalance, and liquidity-near-VWAP research.",
+    "Risk context comes from Chapter 6 metrics, filters, ranking, and research-only enforcement.",
+    "Setup comparison ranks accumulation, trend, rejection, and reversal studies side by side."
+  ],
+  "positionManagement": [
+    "Profit targets can be researched around POC, VAH, VAL, HVN, LVN, VWAP, and prior highs/lows.",
+    "Stops can be researched beyond rejection high/low, VAH/VAL, failed-auction level, or accumulation range.",
+    "Volume-based target/stop notes are documented only; no executable rules are added.",
+    "Early exits can be researched when acceptance fails, VWAP alignment breaks, or L2 quality deteriorates."
+  ],
+  "moneyManagement": [
+    "Risk per trade must be defined before any future strategy execution work.",
+    "R:R should be measured from profile-defined target and invalidation levels.",
+    "Position sizing should account for volatility, spread, and liquidity.",
+    "Correlation and excessive exposure should be considered before combining setups or venues."
+  ],
+  "psychologyNotes": [
+    "Good winner: follows rules and planned target logic.",
+    "Bad winner: profitable only because rules were ignored.",
+    "Good loser: follows invalidation and preserves risk discipline.",
+    "Bad loser: ignores stop, widens risk, or adds outside plan.",
+    "Rule-breaking prevention: keep setup research separate from execution."
+  ],
+  "backtestingProgression": [
+    "Rough backtest: inspect setup exports, quality reports, and passive follow-through.",
+    "Thorough backtest: only after manual review, define explicit signal rules and use the existing backtester.",
+    "Micro trading: not enabled.",
+    "Half positions: not enabled.",
+    "Full positions: not enabled."
+  ],
+  "repoMapping": [
+    {
+      "name": "priceaction/",
+      "details": [
+        "aggression",
+        "sideways action",
+        "initiation",
+        "rejection",
+        "opens",
+        "high/low studies",
+        "failed auctions"
+      ]
+    },
+    {
+      "name": "volumeprofile/",
+      "details": [
+        "price bins",
+        "POC",
+        "VAH/VAL",
+        "HVN/LVN",
+        "profile shapes",
+        "scoped/flexible profiles",
+        "setup studies"
+      ]
+    },
+    {
+      "name": "vwap/",
+      "details": [
+        "session VWAP",
+        "anchored VWAP",
+        "distance",
+        "slope",
+        "regime",
+        "interaction",
+        "context"
+      ]
+    },
+    {
+      "name": "orderbook/",
+      "details": [
+        "normalized L2 schema",
+        "spread",
+        "mid",
+        "depth",
+        "imbalance",
+        "liquidity near price"
+      ]
+    },
+    {
+      "name": "l2recorder/",
+      "details": [
+        "snapshot recorder",
+        "CSV storage",
+        "dataset analysis"
+      ]
+    },
+    {
+      "name": "riskmetrics/",
+      "details": [
+        "Sharpe",
+        "Sortino",
+        "variance",
+        "expectancy",
+        "execution stats",
+        "risk grades"
+      ]
+    },
+    {
+      "name": "backtest/",
+      "details": [
+        "for-loop backtester",
+        "event-driven skeleton",
+        "clock",
+        "splits",
+        "assumptions",
+        "risk-enforced research path"
+      ]
+    },
+    {
+      "name": "research/",
+      "details": [
+        "CSV/JSON/Markdown reports for all book-derived research layers"
+      ]
+    }
+  ],
+  "gaps": [
+    "Tick-accurate Volume Profile.",
+    "Historical L2 replay.",
+    "Real trade tape volume-at-price.",
+    "Manual chart review of strongest setup filters.",
+    "Pacifica adapter later.",
+    "ML later."
+  ],
+  "finalRecommendation": [
+    "Volume Profile book research layer is complete.",
+    "Do not add live or paper trading yet.",
+    "Next best step is manual review of strongest setup filters.",
+    "After manual review, choose either Pacifica adapter work or refined strategy research."
+  ],
+  "generatedDocs": [
+    "docs/volume_profile_playbook.md",
+    "docs/volume_profile_risk_playbook.md",
+    "docs/volume_profile_backtesting_playbook.md"
+  ],
+  "generatedResearch": [
+    "research/volume_setup_comparison.csv",
+    "research/volume_setup_comparison.json",
+    "research/volume_setup_comparison.md",
+    "research/volume_profile_book_completion_packet.json",
+    "research/volume_profile_book_completion_packet.md"
+  ]
+}

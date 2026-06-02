@@ -44,13 +44,13 @@ func BuildChapter6RiskPacket(rankings []riskmetrics.RankedStrategy, gates []risk
 			"poor_risk_grade",
 		},
 		Conclusion: []string{
-			"No strategy is promoted to active/paper execution yet.",
+			"Chapter 6 remains a research-only risk analysis packet.",
 			"RSI, Bollinger, mean_reversion, vol_mean_reversion, and dual_ma remain research candidates but throttled.",
 			"EMA and momentum are removed from candidates.",
 			"Risk layer remains rule-based.",
 			"No ML has been introduced.",
 		},
-		NextRecommendedPhase: "Chapter 7: controlled paper-trading infrastructure and monitoring gates, without enabling active execution.",
+		NextRecommendedPhase: "Chapter 7: trading system architecture and simulation components.",
 	}
 
 	for i, row := range rankings {

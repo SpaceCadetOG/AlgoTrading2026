@@ -4,12 +4,12 @@
 
 - symbol: BTCUSDT
 - candles: 25
-- for_loop_trades: 4
-- event_driven_orders: 8
-- event_driven_fills: 8
-- for_loop_final_equity: 10000.12
-- event_driven_final_pnl: 2252.50
-- pnl_difference: 2252.38
+- for_loop_trades: 6
+- event_driven_orders: 22
+- event_driven_fills: 22
+- for_loop_final_equity: 9999.41
+- event_driven_final_pnl: 4462.13
+- pnl_difference: 4462.72
 - assumptions_difference: for-loop backtester uses direct candle, signal, and simulated fill model; event-driven backtester routes candles through liquidity, order book, strategy, OMS, and market simulator queues; for-loop fills use fee and slippage models; event-driven fills use deterministic crossed-book test liquidity; results are expected to differ because market assumptions differ
 - recommendation: Use for-loop backtests for fast signal research and event-driven backtests for system/OMS/market-simulator assumption validation.
 

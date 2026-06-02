@@ -35,7 +35,7 @@ func TestChapter6RiskPacketMarkdownIncludesConclusion(t *testing.T) {
 	body := Chapter6RiskPacketMarkdown(packet)
 
 	for _, want := range []string{
-		"No strategy is promoted to active/paper execution yet.",
+		"Chapter 6 remains a research-only risk analysis packet.",
 		"Risk layer remains rule-based.",
 		"No ML has been introduced.",
 	} {

@@ -3,14 +3,14 @@
 ## Result
 
 - candles_processed: 25
-- orders_created: 8
-- orders_filled: 8
-- final_cash: 12252.50
+- orders_created: 22
+- orders_filled: 22
+- final_cash: 14462.13
 - final_position: 0.0000
-- final_pnl: 2252.50
-- clock_start: 2026-04-30 02:15:00 +0000 UTC
-- clock_end: 2026-04-30 08:15:00 +0000 UTC
-- audit_events: 16
+- final_pnl: 4462.13
+- clock_start: 2026-05-03 06:00:00 +0000 UTC
+- clock_end: 2026-05-03 12:00:00 +0000 UTC
+- audit_events: 44
 
 ## Implemented
 

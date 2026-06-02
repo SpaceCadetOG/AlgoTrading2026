@@ -19,8 +19,11 @@ import (
 	"AlgoTrading2026/exchanges/lighter"
 	"AlgoTrading2026/features"
 	"AlgoTrading2026/indicators"
+	"AlgoTrading2026/l2recorder"
 	"AlgoTrading2026/labels"
+	"AlgoTrading2026/orderbook"
 	"AlgoTrading2026/pairs"
+	"AlgoTrading2026/realism"
 	"AlgoTrading2026/research"
 	"AlgoTrading2026/risk"
 	"AlgoTrading2026/riskmetrics"
@@ -32,13 +35,16 @@ import (
 	"AlgoTrading2026/strategy"
 	"AlgoTrading2026/system"
 	"AlgoTrading2026/volatility"
+	"AlgoTrading2026/volumeprofile"
+	"AlgoTrading2026/vwap"
 )
 
 const (
-	ResearchDays      = 30
-	ResearchInterval  = "15m"
-	CandlesPerDay15m  = 96
-	ResearchCandleCap = ResearchDays * CandlesPerDay15m
+	ResearchDays             = 30
+	ResearchInterval         = "15m"
+	CandlesPerDay15m         = 96
+	ResearchCandleCap        = ResearchDays * CandlesPerDay15m
+	VWAPTimeframeCandleLimit = 1000
 )
 
 type venueCandles struct {
@@ -60,6 +66,131 @@ type strategyBacktestResult struct {
 	Trades  []strategy.Trade
 }
 
+type vwapChapter3Study struct {
+	ContextRows   []research.ContextFeatureRow
+	TimeframeRows []research.TimeframeFeatureRow
+	TrendRows     []research.TrendAlignmentRow
+	Summary       research.VWAPChapter3Summary
+}
+
+type orderBookResearchRows struct {
+	Features        []research.OrderBookFeatureRow
+	VWAPInteraction []research.VWAPL2InteractionRow
+	Snapshots       []orderbook.OrderBookSnapshot
+}
+
+type vwapL2RefreshStudy struct {
+	FeatureRows []research.VWAPL2FeatureRow
+	ContextRows []research.ContextL2FeatureRow
+	Summary     research.VWAPL2BehaviorSummary
+}
+
+type priceActionStudy struct {
+	Rows    []research.PriceActionFeatureRow
+	Summary research.PriceActionSummary
+}
+
+type priceActionStrategyStudy struct {
+	Rows    []research.PriceActionStrategyStudyRow
+	Summary research.PriceActionStrategySummary
+}
+
+type priceActionPhase3Study struct {
+	Rows    []research.PriceActionPhase3StudyRow
+	Summary research.PriceActionPhase3Summary
+}
+
+type volumeProfileStudy struct {
+	Profile volumeprofile.VolumeProfile
+	Rows    []research.VolumeProfileFeatureRow
+	Summary research.VolumeProfileSummary
+}
+
+type scopedVolumeProfileStudy struct {
+	Profiles []volumeprofile.ScopedProfile
+	Rows     []research.ScopedVolumeProfileFeatureRow
+	Summary  research.ScopedVolumeProfileSummary
+}
+
+type volumeProfileShapeStudy struct {
+	Rows    []research.VolumeProfileShapeStudyRow
+	Summary research.VolumeProfileShapeSummary
+}
+
+type flexibleVolumeProfileStudy struct {
+	Profiles []volumeprofile.FlexibleProfile
+	Rows     []research.FlexibleVolumeProfileRow
+	Summary  research.FlexibleVolumeProfileSummary
+}
+
+type profileAcceptanceQualityStudy struct {
+	Rows    []research.ProfileAcceptanceQualityRow
+	Summary research.ProfileAcceptanceQualitySummary
+}
+
+type volumeSetupAccumulationStudy struct {
+	Rows    []research.VolumeSetupAccumulationRow
+	Summary research.VolumeSetupAccumulationSummary
+}
+
+type volumeSetupAccumulationQualityStudy struct {
+	Rows    []research.VolumeSetupAccumulationQualityRow
+	Summary research.VolumeSetupAccumulationQualitySummary
+}
+
+type volumeSetupTrendStudy struct {
+	Rows    []research.VolumeSetupTrendRow
+	Summary research.VolumeSetupTrendSummary
+}
+
+type volumeSetupTrendQualityStudy struct {
+	Rows    []research.VolumeSetupTrendQualityRow
+	Summary research.VolumeSetupTrendQualitySummary
+}
+
+type volumeSetupRejectionStudy struct {
+	Rows    []research.VolumeSetupRejectionRow
+	Summary research.VolumeSetupRejectionSummary
+}
+
+type volumeSetupRejectionQualityStudy struct {
+	Rows    []research.VolumeSetupRejectionQualityRow
+	Summary research.VolumeSetupRejectionQualitySummary
+}
+
+type volumeSetupReversalStudy struct {
+	Rows    []research.VolumeSetupReversalRow
+	Summary research.VolumeSetupReversalSummary
+}
+
+type volumeSetupReversalQualityStudy struct {
+	Rows    []research.VolumeSetupReversalQualityRow
+	Summary research.VolumeSetupReversalQualitySummary
+}
+
+type volumeSetupComparisonStudy struct {
+	Rows    []research.VolumeSetupComparisonRow
+	Summary research.VolumeSetupComparisonSummary
+}
+
+type volumeProfileBookCompletionStudy struct {
+	Packet research.VolumeProfileBookCompletionPacket
+}
+
+type setupFeatureLabelStudy struct {
+	Rows    []research.SetupFeatureLabelRow
+	Summary research.SetupLabelsSummary
+}
+
+type instrumentUniverseStudy struct {
+	Rows    []research.InstrumentUniverseRow
+	Summary research.InstrumentUniverseSummary
+}
+
+type volumeProfileFinalBookStudy struct {
+	Packet research.VolumeProfileFinalBookPacket
+}
+
 func asterEnv(name string) string {
 	if config.IsTestnet() {
 		return os.Getenv("ASTER_TESTNET_" + name)
@@ -67,10 +198,41 @@ func asterEnv(name string) string {
 	return os.Getenv("ASTER_" + name)
 }
 
+func runL2Recorder() {
+	cfg := l2recorder.DefaultRecorderConfig()
+	recorder := l2recorder.NewRecorder(cfg, nil, nil)
+
+	fmt.Println("=== HISTORICAL L2 RECORDER ===")
+	fmt.Printf("venues=%d\n", len(cfg.Venues))
+	fmt.Printf("symbols=%d\n", len(cfg.Symbols))
+	fmt.Printf("intervalSeconds=%d\n", cfg.IntervalSeconds)
+	fmt.Printf("maxSnapshots=%d\n", cfg.MaxSnapshots)
+	fmt.Printf("output=%s\n", cfg.OutputPath)
+	fmt.Println()
+
+	summary, err := recorder.Run()
+	if err != nil {
+		log.Fatalf("run l2 recorder: %v", err)
+	}
+	fmt.Printf("rounds=%d\n", summary.Rounds)
+	fmt.Printf("rows=%d\n", summary.Rows)
+	fmt.Printf("errors=%d\n", summary.Errors)
+	fmt.Printf("wrote %s\n", cfg.OutputPath)
+}
+
 func main() {
 	_ = godotenv.Load()
 	log.Println("TRADING_ENV:", config.TradingEnv())
 
+	if strings.EqualFold(os.Getenv("RUN_L2_RECORDER"), "true") {
+		runL2Recorder()
+		return
+	}
+
+	runResearchHarness()
+}
+
+func runResearchHarness() {
 	venues := fetchVenueCandles(ResearchInterval, ResearchCandleCap)
 	for _, venue := range venues {
 		log.Printf("venue=%s symbol=%s candles=%d", venue.Venue, venue.Symbol, len(venue.Candles))
@@ -83,6 +245,34 @@ func main() {
 
 	frame := series.FromCandles(primary.Candles)
 
+	vwapRows := buildVWAPFeatures(primary.Candles)
+	vwapInteractions, vwapReactions, vwapBehaviorSummary := buildVWAPBehaviorStudy(primary.Candles)
+	vwapChapter3 := buildVWAPChapter3Study(primary.Candles, fetchVWAPTimeframeCandles())
+	priceAction := buildPriceActionStudy(primary.Candles)
+	priceActionStrategies := buildPriceActionStrategyStudy(primary.Candles)
+	priceActionPhase3 := buildPriceActionPhase3Study(primary.Candles)
+	volumeProfile := buildVolumeProfileStudy(primary.Candles)
+	scopedVolumeProfile := buildScopedVolumeProfileStudy(primary.Candles)
+	volumeProfileShapes := buildVolumeProfileShapeStudy(scopedVolumeProfile.Profiles)
+	flexibleVolumeProfiles := buildFlexibleVolumeProfileStudy(primary.Candles, priceAction.Rows, priceActionStrategies.Rows, priceActionPhase3.Rows)
+	profileAcceptanceQuality := buildProfileAcceptanceQualityStudy()
+	volumeSetupAccumulation := buildVolumeSetupAccumulationStudy()
+	volumeSetupAccumulationQuality := buildVolumeSetupAccumulationQualityStudy()
+	volumeSetupTrend := buildVolumeSetupTrendStudy()
+	volumeSetupTrendQuality := buildVolumeSetupTrendQualityStudy()
+	volumeSetupRejection := buildVolumeSetupRejectionStudy()
+	volumeSetupRejectionQuality := buildVolumeSetupRejectionQualityStudy()
+	volumeSetupReversal := buildVolumeSetupReversalStudy()
+	volumeSetupReversalQuality := buildVolumeSetupReversalQualityStudy()
+	volumeSetupComparison := buildVolumeSetupComparisonStudy()
+	setupFeatureLabels := buildSetupFeatureLabelExport(primary.Candles)
+	orderBookSnapshots := fetchMultiVenueL2Snapshots()
+	hyperliquidL2Snapshot := snapshotByVenue(orderBookSnapshots, "hyperliquid")
+	orderBookRows := buildOrderBookResearchRows(orderBookSnapshots, candlesByVenue(venues))
+	instrumentUniverse := buildInstrumentUniverseStudy(orderBookRows.Features, venues)
+	volumeProfileFinalBook := buildVolumeProfileFinalBookPacket()
+	vwapL2Refresh := buildVWAPL2RefreshStudy(venues, orderBookRows.Snapshots)
+	l2SnapshotAnalysis, l2SnapshotAnalysisOK := buildL2SnapshotAnalysis()
 	chapter2Results := runChapter2(primary, frame)
 	featureRows, labelRows, trainingRows := runChapter3(primary, frame)
 	chapter4SingleResults, chapter4VenueRows, chapter4VenueAnalyses, pairCandidates := runChapter4(venues, primary, frame)
@@ -174,11 +364,317 @@ func main() {
 	fmt.Printf("featureRows=%d\n", summary.FeatureRows)
 	fmt.Printf("labelRows=%d\n", summary.LabelRows)
 	fmt.Printf("trainingRows=%d\n", summary.TrainingRows)
+	fmt.Printf("vwapRows=%d\n", len(vwapRows))
 	fmt.Println()
 	fmt.Printf("pairCandidates=%d\n", summary.PairCandidates)
 	fmt.Println()
 	fmt.Println("wrote " + summaryPath)
 	fmt.Println()
+	fmt.Println("=== VWAP CHAPTER 2 BEHAVIOR STUDY ===")
+	fmt.Printf("candles=%d\n", vwapBehaviorSummary.Candles)
+	fmt.Printf("touches=%d\n", vwapBehaviorSummary.Touches)
+	fmt.Printf("crosses=%d\n", vwapBehaviorSummary.Crosses)
+	fmt.Printf("bounces=%d\n", vwapBehaviorSummary.Bounces)
+	fmt.Printf("breaks=%d\n", vwapBehaviorSummary.Breaks)
+	fmt.Printf("chops=%d\n", vwapBehaviorSummary.Chops)
+	fmt.Printf("bounceRate=%.2f\n", vwapBehaviorSummary.BounceRate)
+	fmt.Printf("breakRate=%.2f\n", vwapBehaviorSummary.BreakRate)
+	fmt.Printf("interactionRows=%d\n", len(vwapInteractions))
+	fmt.Printf("reactionRows=%d\n", len(vwapReactions))
+	fmt.Println("wrote research/vwap_interaction.csv")
+	fmt.Println("wrote research/vwap_reactions.csv")
+	fmt.Println("wrote research/vwap_behavior_summary.json")
+	fmt.Println()
+	fmt.Println("=== VWAP CHAPTER 3 CONTEXT STUDY ===")
+	fmt.Printf("candles=%d\n", vwapChapter3.Summary.TotalCandles)
+	fmt.Printf("bullAlignments=%d\n", vwapChapter3.Summary.BullAlignmentCount)
+	fmt.Printf("bearAlignments=%d\n", vwapChapter3.Summary.BearAlignmentCount)
+	fmt.Printf("mixedAlignments=%d\n", vwapChapter3.Summary.MixedCount)
+	fmt.Printf("strongBull=%d\n", vwapChapter3.Summary.StrongBullCount)
+	fmt.Printf("strongBear=%d\n", vwapChapter3.Summary.StrongBearCount)
+	fmt.Printf("contextRows=%d\n", len(vwapChapter3.ContextRows))
+	fmt.Printf("timeframeRows=%d\n", len(vwapChapter3.TimeframeRows))
+	fmt.Printf("trendRows=%d\n", len(vwapChapter3.TrendRows))
+	fmt.Println("wrote research/context_features.csv")
+	fmt.Println("wrote research/timeframe_features.csv")
+	fmt.Println("wrote research/trend_alignment.csv")
+	fmt.Println("wrote research/chapter3_summary.json")
+	fmt.Println()
+	fmt.Println("=== VOLUME PROFILE BOOK PRICE ACTION FOUNDATION ===")
+	fmt.Printf("candles=%d\n", priceAction.Summary.Candles)
+	fmt.Printf("sidewaysAreas=%d\n", priceAction.Summary.SidewaysAreas)
+	fmt.Printf("bullishInitiations=%d\n", priceAction.Summary.BullishInitiations)
+	fmt.Printf("bearishInitiations=%d\n", priceAction.Summary.BearishInitiations)
+	fmt.Printf("bullishRejections=%d\n", priceAction.Summary.BullishRejections)
+	fmt.Printf("bearishRejections=%d\n", priceAction.Summary.BearishRejections)
+	fmt.Printf("failedAuctions=%d\n", priceAction.Summary.FailedAuctions)
+	fmt.Println("wrote research/price_action_features.csv")
+	fmt.Println("wrote research/price_action_summary.json")
+	fmt.Println()
+	fmt.Println("=== VOLUME PROFILE BOOK PRICE ACTION STRATEGY STUDY ===")
+	fmt.Printf("candles=%d\n", priceActionStrategies.Summary.Candles)
+	fmt.Printf("srFlipSetups=%d\n", priceActionStrategies.Summary.SRFlipSetups)
+	fmt.Printf("openDriveSetups=%d\n", priceActionStrategies.Summary.OpenDriveSetups)
+	fmt.Printf("abcdSetups=%d\n", priceActionStrategies.Summary.ABCDSetups)
+	fmt.Printf("sessionOpenSetups=%d\n", priceActionStrategies.Summary.SessionOpenSetups)
+	fmt.Printf("dailyOpenSetups=%d\n", priceActionStrategies.Summary.DailyOpenSetups)
+	fmt.Println("wrote research/price_action_strategy_study.csv")
+	fmt.Println("wrote research/price_action_strategy_summary.json")
+	fmt.Println()
+	fmt.Println("=== VOLUME PROFILE BOOK PRICE ACTION PHASE 3 ===")
+	fmt.Printf("candles=%d\n", priceActionPhase3.Summary.Candles)
+	fmt.Printf("dailyHighRetests=%d\n", priceActionPhase3.Summary.DailyHighRetests)
+	fmt.Printf("dailyLowRetests=%d\n", priceActionPhase3.Summary.DailyLowRetests)
+	fmt.Printf("weeklyHighRetests=%d\n", priceActionPhase3.Summary.WeeklyHighRetests)
+	fmt.Printf("weeklyLowRetests=%d\n", priceActionPhase3.Summary.WeeklyLowRetests)
+	fmt.Printf("strongHighs=%d\n", priceActionPhase3.Summary.StrongHighs)
+	fmt.Printf("strongLows=%d\n", priceActionPhase3.Summary.StrongLows)
+	fmt.Printf("weakHighs=%d\n", priceActionPhase3.Summary.WeakHighs)
+	fmt.Printf("weakLows=%d\n", priceActionPhase3.Summary.WeakLows)
+	fmt.Printf("failedHighAuctions=%d\n", priceActionPhase3.Summary.FailedHighAuctions)
+	fmt.Printf("failedLowAuctions=%d\n", priceActionPhase3.Summary.FailedLowAuctions)
+	fmt.Println("wrote research/price_action_phase3_study.csv")
+	fmt.Println("wrote research/price_action_phase3_summary.json")
+	fmt.Println()
+	fmt.Println("=== VOLUME PROFILE FOUNDATION ===")
+	fmt.Printf("profiles=%d\n", volumeProfile.Summary.Profiles)
+	fmt.Printf("bins=%d\n", volumeProfile.Summary.Bins)
+	fmt.Printf("poc=%.2f\n", volumeProfile.Summary.POC)
+	fmt.Printf("vah=%.2f\n", volumeProfile.Summary.VAH)
+	fmt.Printf("val=%.2f\n", volumeProfile.Summary.VAL)
+	fmt.Printf("hvns=%d\n", volumeProfile.Summary.HVNs)
+	fmt.Printf("lvns=%d\n", volumeProfile.Summary.LVNs)
+	fmt.Printf("shape=%s\n", volumeProfile.Profile.Shape)
+	fmt.Println("wrote research/volume_profile_features.csv")
+	fmt.Println("wrote research/volume_profile_summary.json")
+	fmt.Println()
+	fmt.Println("=== VOLUME PROFILE SCOPED PROFILES ===")
+	fmt.Printf("dailyPOC=%.2f\n", scopedPOC(scopedVolumeProfile.Profiles, volumeprofile.ScopeDailySession))
+	fmt.Printf("rolling3dPOC=%.2f\n", scopedPOC(scopedVolumeProfile.Profiles, volumeprofile.ScopeRolling3D))
+	fmt.Printf("rolling7dPOC=%.2f\n", scopedPOC(scopedVolumeProfile.Profiles, volumeprofile.ScopeRolling7D))
+	fmt.Printf("composite30dPOC=%.2f\n", scopedPOC(scopedVolumeProfile.Profiles, volumeprofile.ScopeComposite30D))
+	fmt.Println("wrote research/volume_profile_scoped_features.csv")
+	fmt.Println("wrote research/volume_profile_scoped_summary.json")
+	fmt.Println()
+	fmt.Println("=== VOLUME PROFILE SHAPE STUDY ===")
+	fmt.Printf("dailyShape=%s\n", volumeProfileShapes.Summary.Daily.Shape)
+	fmt.Printf("rolling3dShape=%s\n", volumeProfileShapes.Summary.Rolling3D.Shape)
+	fmt.Printf("rolling7dShape=%s\n", volumeProfileShapes.Summary.Rolling7D.Shape)
+	fmt.Printf("composite30dShape=%s\n", volumeProfileShapes.Summary.Composite30D.Shape)
+	fmt.Println("wrote research/volume_profile_shape_study.csv")
+	fmt.Println("wrote research/volume_profile_shape_summary.json")
+	fmt.Println()
+	fmt.Println("=== FLEXIBLE VOLUME PROFILE ===")
+	fmt.Printf("sidewaysProfiles=%d\n", flexibleVolumeProfiles.Summary.SidewaysAccumulationProfiles)
+	fmt.Printf("openDriveProfiles=%d\n", flexibleVolumeProfiles.Summary.OpenDriveProfiles)
+	fmt.Printf("failedAuctionProfiles=%d\n", flexibleVolumeProfiles.Summary.FailedAuctionProfiles)
+	fmt.Printf("highLowRetestProfiles=%d\n", flexibleVolumeProfiles.Summary.HighLowRetestProfiles)
+	fmt.Printf("acceptedProfiles=%d\n", flexibleVolumeProfiles.Summary.AcceptedProfiles)
+	fmt.Printf("rejectedProfiles=%d\n", flexibleVolumeProfiles.Summary.RejectedProfiles)
+	fmt.Println("wrote research/flexible_volume_profile.csv")
+	fmt.Println("wrote research/flexible_volume_profile_summary.json")
+	fmt.Println()
+	fmt.Println("=== PROFILE ACCEPTANCE QUALITY ===")
+	fmt.Printf("bestProfileType=%s\n", profileAcceptanceQuality.Summary.BestProfileType)
+	fmt.Printf("bestProfileAcceptanceRate=%.2f\n", profileAcceptanceQuality.Summary.BestProfileAcceptanceRate)
+	fmt.Printf("bestShape=%s\n", profileAcceptanceQuality.Summary.BestShape)
+	fmt.Printf("bestShapeAcceptanceRate=%.2f\n", profileAcceptanceQuality.Summary.BestShapeAcceptanceRate)
+	fmt.Printf("acceptedProfiles=%d\n", profileAcceptanceQuality.Summary.AcceptedProfiles)
+	fmt.Printf("rejectedProfiles=%d\n", profileAcceptanceQuality.Summary.RejectedProfiles)
+	fmt.Println("wrote research/profile_acceptance_quality.csv")
+	fmt.Println("wrote research/profile_acceptance_quality_summary.json")
+	fmt.Println()
+	fmt.Println("=== VOLUME SETUP #1 ACCUMULATION STUDY ===")
+	fmt.Printf("setups=%d\n", volumeSetupAccumulation.Summary.Setups)
+	fmt.Printf("longContexts=%d\n", volumeSetupAccumulation.Summary.LongContexts)
+	fmt.Printf("shortContexts=%d\n", volumeSetupAccumulation.Summary.ShortContexts)
+	fmt.Printf("accepted=%d\n", volumeSetupAccumulation.Summary.Accepted)
+	fmt.Printf("rejected=%d\n", volumeSetupAccumulation.Summary.Rejected)
+	fmt.Printf("retests=%d\n", volumeSetupAccumulation.Summary.Retests)
+	fmt.Printf("dailyPocConfluence=%d\n", volumeSetupAccumulation.Summary.DailyPOCConfluence)
+	fmt.Printf("rolling3dPocConfluence=%d\n", volumeSetupAccumulation.Summary.Rolling3DPOCConfluence)
+	fmt.Printf("rolling7dPocConfluence=%d\n", volumeSetupAccumulation.Summary.Rolling7DPOCConfluence)
+	fmt.Printf("composite30dPocConfluence=%d\n", volumeSetupAccumulation.Summary.Composite30DPOCConfluence)
+	fmt.Println("wrote research/volume_setup_accumulation.csv")
+	fmt.Println("wrote research/volume_setup_accumulation_summary.json")
+	fmt.Println()
+	fmt.Println("=== VOLUME SETUP #1 QUALITY ===")
+	fmt.Printf("totalSetups=%d\n", volumeSetupAccumulationQuality.Summary.TotalSetups)
+	fmt.Printf("bestConfluenceGroup=%s\n", volumeSetupAccumulationQuality.Summary.BestConfluenceGroup)
+	fmt.Printf("bestConfluenceAcceptanceRate=%.2f\n", volumeSetupAccumulationQuality.Summary.BestConfluenceAcceptanceRate)
+	fmt.Printf("bestShape=%s\n", volumeSetupAccumulationQuality.Summary.BestShape)
+	fmt.Printf("bestShapeAcceptanceRate=%.2f\n", volumeSetupAccumulationQuality.Summary.BestShapeAcceptanceRate)
+	fmt.Printf("bestDirection=%s\n", volumeSetupAccumulationQuality.Summary.BestDirection)
+	fmt.Printf("bestDirectionFollowThrough20=%.2f\n", volumeSetupAccumulationQuality.Summary.BestDirectionAverageFollowThrough20)
+	fmt.Println("wrote research/volume_setup_accumulation_quality.csv")
+	fmt.Println("wrote research/volume_setup_accumulation_quality_summary.json")
+	fmt.Println("wrote research/volume_setup_accumulation_quality.md")
+	fmt.Println()
+	fmt.Println("=== VOLUME SETUP #2 TREND STUDY ===")
+	fmt.Printf("setups=%d\n", volumeSetupTrend.Summary.Setups)
+	fmt.Printf("longContexts=%d\n", volumeSetupTrend.Summary.LongContexts)
+	fmt.Printf("shortContexts=%d\n", volumeSetupTrend.Summary.ShortContexts)
+	fmt.Printf("accepted=%d\n", volumeSetupTrend.Summary.Accepted)
+	fmt.Printf("rejected=%d\n", volumeSetupTrend.Summary.Rejected)
+	fmt.Printf("pocRetests=%d\n", volumeSetupTrend.Summary.POCRetests)
+	fmt.Printf("hvnRetests=%d\n", volumeSetupTrend.Summary.HVNRetests)
+	fmt.Printf("vwapAligned=%d\n", volumeSetupTrend.Summary.VWAPAligned)
+	fmt.Printf("bidPressureAligned=%d\n", volumeSetupTrend.Summary.BidPressureAligned)
+	fmt.Printf("askPressureAligned=%d\n", volumeSetupTrend.Summary.AskPressureAligned)
+	fmt.Printf("averageTrendStrength=%.2f\n", volumeSetupTrend.Summary.AverageTrendStrength)
+	fmt.Println("wrote research/volume_setup_trend.csv")
+	fmt.Println("wrote research/volume_setup_trend_summary.json")
+	fmt.Println()
+	fmt.Println("=== VOLUME SETUP #2 QUALITY ===")
+	fmt.Printf("totalSetups=%d\n", volumeSetupTrendQuality.Summary.TotalSetups)
+	fmt.Printf("bestDirection=%s\n", volumeSetupTrendQuality.Summary.BestDirection)
+	fmt.Printf("bestDirectionFollowThrough20=%.2f\n", volumeSetupTrendQuality.Summary.BestDirectionFollowThrough20)
+	fmt.Printf("bestShape=%s\n", volumeSetupTrendQuality.Summary.BestShape)
+	fmt.Printf("bestShapeAcceptanceRate=%.2f\n", volumeSetupTrendQuality.Summary.BestShapeAcceptanceRate)
+	fmt.Printf("bestTrendStrengthBucket=%s\n", volumeSetupTrendQuality.Summary.BestTrendStrengthBucket)
+	fmt.Printf("bestTrendStrengthAcceptanceRate=%.2f\n", volumeSetupTrendQuality.Summary.BestTrendStrengthAcceptanceRate)
+	fmt.Printf("bestConfluence=%s\n", volumeSetupTrendQuality.Summary.BestConfluence)
+	fmt.Printf("bestConfluenceAcceptanceRate=%.2f\n", volumeSetupTrendQuality.Summary.BestConfluenceAcceptanceRate)
+	fmt.Println("wrote research/volume_setup_trend_quality.csv")
+	fmt.Println("wrote research/volume_setup_trend_quality_summary.json")
+	fmt.Println("wrote research/volume_setup_trend_quality.md")
+	fmt.Println()
+	fmt.Println("=== VOLUME SETUP #3 REJECTION STUDY ===")
+	fmt.Printf("setups=%d\n", volumeSetupRejection.Summary.Setups)
+	fmt.Printf("longContexts=%d\n", volumeSetupRejection.Summary.LongContexts)
+	fmt.Printf("shortContexts=%d\n", volumeSetupRejection.Summary.ShortContexts)
+	fmt.Printf("accepted=%d\n", volumeSetupRejection.Summary.Accepted)
+	fmt.Printf("rejected=%d\n", volumeSetupRejection.Summary.Rejected)
+	fmt.Printf("pocRetests=%d\n", volumeSetupRejection.Summary.POCRetests)
+	fmt.Printf("hvnRetests=%d\n", volumeSetupRejection.Summary.HVNRetests)
+	fmt.Printf("vwapAligned=%d\n", volumeSetupRejection.Summary.VWAPAligned)
+	fmt.Printf("bidPressureAligned=%d\n", volumeSetupRejection.Summary.BidPressureAligned)
+	fmt.Printf("askPressureAligned=%d\n", volumeSetupRejection.Summary.AskPressureAligned)
+	fmt.Printf("dailyPocConfluence=%d\n", volumeSetupRejection.Summary.DailyPOCConfluence)
+	fmt.Printf("rolling3dPocConfluence=%d\n", volumeSetupRejection.Summary.Rolling3DPOCConfluence)
+	fmt.Printf("rolling7dPocConfluence=%d\n", volumeSetupRejection.Summary.Rolling7DPOCConfluence)
+	fmt.Printf("composite30dPocConfluence=%d\n", volumeSetupRejection.Summary.Composite30DPOCConfluence)
+	fmt.Println("wrote research/volume_setup_rejection.csv")
+	fmt.Println("wrote research/volume_setup_rejection_summary.json")
+	fmt.Println()
+	fmt.Println("=== VOLUME SETUP #3 QUALITY ===")
+	fmt.Printf("totalSetups=%d\n", volumeSetupRejectionQuality.Summary.TotalSetups)
+	fmt.Printf("bestDirection=%s\n", volumeSetupRejectionQuality.Summary.BestDirection)
+	fmt.Printf("bestDirectionFollowThrough20=%.2f\n", volumeSetupRejectionQuality.Summary.BestDirectionFollowThrough20)
+	fmt.Printf("bestShape=%s\n", volumeSetupRejectionQuality.Summary.BestShape)
+	fmt.Printf("bestShapeAcceptanceRate=%.2f\n", volumeSetupRejectionQuality.Summary.BestShapeAcceptanceRate)
+	fmt.Printf("bestConfluence=%s\n", volumeSetupRejectionQuality.Summary.BestConfluence)
+	fmt.Printf("bestConfluenceAcceptanceRate=%.2f\n", volumeSetupRejectionQuality.Summary.BestConfluenceAcceptanceRate)
+	fmt.Printf("bestFilter=%s\n", volumeSetupRejectionQuality.Summary.BestFilter)
+	fmt.Printf("bestFilterFollowThrough20=%.2f\n", volumeSetupRejectionQuality.Summary.BestFilterFollowThrough20)
+	fmt.Println("wrote research/volume_setup_rejection_quality.csv")
+	fmt.Println("wrote research/volume_setup_rejection_quality_summary.json")
+	fmt.Println("wrote research/volume_setup_rejection_quality.md")
+	fmt.Println()
+	fmt.Println("=== VOLUME PROFILE REVERSAL TRADE STUDY ===")
+	fmt.Printf("setups=%d\n", volumeSetupReversal.Summary.Setups)
+	fmt.Printf("longContexts=%d\n", volumeSetupReversal.Summary.LongContexts)
+	fmt.Printf("shortContexts=%d\n", volumeSetupReversal.Summary.ShortContexts)
+	fmt.Printf("accepted=%d\n", volumeSetupReversal.Summary.Accepted)
+	fmt.Printf("rejected=%d\n", volumeSetupReversal.Summary.Rejected)
+	fmt.Printf("neutral=%d\n", volumeSetupReversal.Summary.Neutral)
+	fmt.Printf("vwapAligned=%d\n", volumeSetupReversal.Summary.VWAPAligned)
+	fmt.Printf("pocConfluence=%d\n", volumeSetupReversal.Summary.POCConfluence)
+	fmt.Printf("hvnConfluence=%d\n", volumeSetupReversal.Summary.HVNConfluence)
+	fmt.Printf("vahValRejections=%d\n", volumeSetupReversal.Summary.VAHVALRejections)
+	fmt.Printf("averageFollowThrough20=%.2f\n", volumeSetupReversal.Summary.AverageFollowThrough20)
+	fmt.Println("wrote research/volume_setup_reversal.csv")
+	fmt.Println("wrote research/volume_setup_reversal_summary.json")
+	fmt.Println()
+	fmt.Println("=== REVERSAL LABEL AUDIT ===")
+	fmt.Println("rootCause=Reversal setup rows did not expose accepted/rejected outcome fields, so comparison counted zero outcomes.")
+	fmt.Printf("accepted=%d\n", volumeSetupReversal.Summary.Accepted)
+	fmt.Printf("rejected=%d\n", volumeSetupReversal.Summary.Rejected)
+	fmt.Printf("neutral=%d\n", volumeSetupReversal.Summary.Neutral)
+	fmt.Println()
+	fmt.Println("=== REVERSAL QUALITY ===")
+	fmt.Printf("bestDirection=%s\n", volumeSetupReversalQuality.Summary.BestDirection)
+	fmt.Printf("bestConfluence=%s\n", volumeSetupReversalQuality.Summary.BestConfluence)
+	fmt.Printf("bestFT20=%.2f\n", volumeSetupReversalQuality.Summary.BestFilterFollowThrough20)
+	fmt.Println("wrote research/volume_setup_reversal_quality.csv")
+	fmt.Println("wrote research/volume_setup_reversal_quality_summary.json")
+	fmt.Println("wrote research/volume_setup_reversal_quality.md")
+	fmt.Println()
+	fmt.Println("=== VOLUME PROFILE SETUP COMPARISON ===")
+	fmt.Printf("bestAcceptanceSetup=%s\n", volumeSetupComparison.Summary.BestAcceptanceSetup)
+	fmt.Printf("bestAcceptanceRate=%.2f\n", volumeSetupComparison.Summary.BestAcceptanceRate)
+	fmt.Printf("bestFT20Setup=%s\n", volumeSetupComparison.Summary.BestFT20Setup)
+	fmt.Printf("bestVWAPSetup=%s\n", volumeSetupComparison.Summary.BestVWAPSetup)
+	fmt.Printf("bestPOCSetup=%s\n", volumeSetupComparison.Summary.BestPOCSetup)
+	fmt.Printf("bestHVNSetup=%s\n", volumeSetupComparison.Summary.BestHVNSetup)
+	fmt.Printf("largestSampleSetup=%s\n", volumeSetupComparison.Summary.LargestSampleSetup)
+	fmt.Println("wrote research/volume_setup_comparison.csv")
+	fmt.Println("wrote research/volume_setup_comparison.json")
+	fmt.Println("wrote research/volume_setup_comparison.md")
+	fmt.Println()
+	fmt.Println("=== UPDATED SETUP COMPARISON ===")
+	fmt.Printf("bestAcceptanceSetup=%s\n", volumeSetupComparison.Summary.BestAcceptanceSetup)
+	fmt.Printf("bestFT20Setup=%s\n", volumeSetupComparison.Summary.BestFT20Setup)
+	fmt.Printf("bestVWAPSetup=%s\n", volumeSetupComparison.Summary.BestVWAPSetup)
+	fmt.Println()
+	fmt.Println("=== SETUP FEATURE/LABEL EXPORT ===")
+	fmt.Printf("rows=%d\n", setupFeatureLabels.Summary.Rows)
+	fmt.Printf("reversalRows=%d\n", setupFeatureLabels.Summary.BySetupType["REVERSAL"])
+	fmt.Printf("accumulationRows=%d\n", setupFeatureLabels.Summary.BySetupType["ACCUMULATION"])
+	fmt.Printf("trendRows=%d\n", setupFeatureLabels.Summary.BySetupType["TREND"])
+	fmt.Printf("rejectionRows=%d\n", setupFeatureLabels.Summary.BySetupType["REJECTION"])
+	fmt.Printf("upperHits=%d\n", setupFeatureLabels.Summary.TripleBarrierLabels["upper_hit"])
+	fmt.Printf("lowerHits=%d\n", setupFeatureLabels.Summary.TripleBarrierLabels["lower_hit"])
+	fmt.Printf("timeExpired=%d\n", setupFeatureLabels.Summary.TripleBarrierLabels["time_expired"])
+	fmt.Println("wrote research/setup_features_labels.csv")
+	fmt.Println("wrote research/setup_labels_summary.json")
+	fmt.Println()
+	fmt.Println("=== INSTRUMENT UNIVERSE RESEARCH SCANNER ===")
+	fmt.Printf("venues=%d\n", instrumentUniverse.Summary.Venues)
+	fmt.Printf("symbols=%d\n", instrumentUniverse.Summary.Symbols)
+	fmt.Printf("crypto=%d\n", instrumentUniverse.Summary.Crypto)
+	fmt.Printf("rwa=%d\n", instrumentUniverse.Summary.RWA)
+	fmt.Printf("topInstrument=%s\n", instrumentUniverse.Summary.TopInstrument)
+	fmt.Println("wrote research/instrument_universe.csv")
+	fmt.Println("wrote research/instrument_universe_summary.json")
+	fmt.Println()
+	fmt.Println("=== VOLUME PROFILE FINAL BOOK PACKET ===")
+	fmt.Println("status=complete")
+	fmt.Printf("docs=%d\n", len(volumeProfileFinalBook.Packet.CompletedDocs))
+	fmt.Printf("archivedAudits=%d\n", volumeProfileFinalBook.Packet.ArchivedAudits)
+	fmt.Println("packet=research/volume_profile_final_book_packet.md")
+	fmt.Println()
+	printHyperliquidL2Snapshot(hyperliquidL2Snapshot)
+	printMultiVenueL2Summary(orderBookRows.Snapshots)
+	fmt.Println("=== ORDER BOOK RESEARCH EXPORTS ===")
+	fmt.Printf("orderbookFeatureRows=%d\n", len(orderBookRows.Features))
+	fmt.Printf("vwapL2InteractionRows=%d\n", len(orderBookRows.VWAPInteraction))
+	fmt.Println("wrote research/orderbook_features.csv")
+	fmt.Println("wrote research/vwap_l2_interaction.csv")
+	fmt.Println("wrote research/multi_venue_orderbook_features.csv")
+	fmt.Println("wrote research/multi_venue_vwap_l2_interaction.csv")
+	fmt.Println()
+	fmt.Println("=== VWAP CHAPTER 1-3 L2 REFRESH ===")
+	fmt.Printf("venues=%d\n", len(orderBookRows.Snapshots))
+	fmt.Printf("featureRows=%d\n", len(vwapL2Refresh.FeatureRows))
+	fmt.Printf("contextRows=%d\n", len(vwapL2Refresh.ContextRows))
+	fmt.Printf("bounceBidSupport=%d\n", vwapL2Refresh.Summary.BounceBidSupport)
+	fmt.Printf("bounceAskWeakness=%d\n", vwapL2Refresh.Summary.BounceAskWeakness)
+	fmt.Printf("breakAskPressure=%d\n", vwapL2Refresh.Summary.BreakAskPressure)
+	fmt.Printf("breakBidCollapse=%d\n", vwapL2Refresh.Summary.BreakBidCollapse)
+	fmt.Println("wrote research/vwap_features_l2.csv")
+	fmt.Println("wrote research/context_features_l2.csv")
+	fmt.Println("wrote research/vwap_behavior_l2_summary.json")
+	fmt.Println()
+	if l2SnapshotAnalysisOK {
+		fmt.Println("=== HISTORICAL L2 ANALYSIS ===")
+		fmt.Printf("rows=%d\n", l2SnapshotAnalysis.DatasetQuality.TotalRows)
+		fmt.Printf("validRows=%d\n", l2SnapshotAnalysis.DatasetQuality.ValidRows)
+		fmt.Printf("venues=%d\n", len(l2SnapshotAnalysis.VenueSummaries))
+		fmt.Println("wrote research/l2_snapshot_analysis.json")
+		fmt.Println("wrote research/l2_snapshot_analysis.md")
+		fmt.Println()
+	}
 	fmt.Println("=== CHAPTER 6 RISK ANALYTICS ===")
 	fmt.Println()
 	fmt.Println("strategy sharpe sortino expectancy drawdown grade")
@@ -251,7 +747,7 @@ func main() {
 	fmt.Printf("keptThrottled=%d\n", len(chapter6Packet.KeptThrottled))
 	fmt.Printf("rewriteRequired=%d\n", len(chapter6Packet.RewriteRequired))
 	fmt.Printf("removedFromCandidates=%d\n", len(chapter6Packet.RemovedFromCandidates))
-	fmt.Println("conclusion=No strategy is promoted to active/paper execution yet.")
+	fmt.Println("conclusion=Chapter 6 remains a research-only risk analysis packet.")
 	fmt.Println("next=" + chapter6Packet.NextRecommendedPhase)
 	fmt.Println()
 	fmt.Println("wrote " + packetJSONPath)
@@ -494,6 +990,133 @@ func main() {
 	fmt.Println("recommendation=" + comparisonResult.Recommendation)
 	fmt.Println("wrote " + chapter9ComparisonJSONPath)
 	fmt.Println("wrote " + chapter9ComparisonMarkdownPath)
+	chapter9Packet := research.BuildChapter9Packet(chapter9Audit, chapter9TimeReport, chapter9EventReport, chapter9ComparisonReport)
+	chapter9PacketJSONPath := "research/chapter9_packet.json"
+	if err := research.WriteChapter9PacketJSON(chapter9PacketJSONPath, chapter9Packet); err != nil {
+		log.Fatalf("write chapter 9 packet json: %v", err)
+	}
+	chapter9PacketMarkdownPath := "research/chapter9_packet.md"
+	if err := research.WriteChapter9PacketMarkdown(chapter9PacketMarkdownPath, chapter9Packet); err != nil {
+		log.Fatalf("write chapter 9 packet markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 9F FINAL BACKTESTER PACKET ===")
+	fmt.Printf(
+		"concepts=%d assumptionGaps=%d chapter10Deferred=%d\n",
+		len(chapter9Packet.ImplementedConcepts),
+		len(chapter9Packet.AssumptionGaps),
+		len(chapter9Packet.Chapter10DeferredGaps),
+	)
+	fmt.Println("conclusion=Chapter 9 backtesting layer is complete.")
+	fmt.Println("readiness=" + chapter9Packet.ReadinessForChapter10)
+	fmt.Println("wrote " + chapter9PacketJSONPath)
+	fmt.Println("wrote " + chapter9PacketMarkdownPath)
+	chapter10Audit := research.BuildChapter10RealismAudit(comparisonResult)
+	chapter10AuditJSONPath := "research/chapter10_realism_audit.json"
+	if err := research.WriteChapter10RealismAuditJSON(chapter10AuditJSONPath, chapter10Audit); err != nil {
+		log.Fatalf("write chapter 10 realism audit json: %v", err)
+	}
+	chapter10AuditMarkdownPath := "research/chapter10_realism_audit.md"
+	if err := research.WriteChapter10RealismAuditMarkdown(chapter10AuditMarkdownPath, chapter10Audit); err != nil {
+		log.Fatalf("write chapter 10 realism audit markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 10A REALISM AUDIT ===")
+	fmt.Printf(
+		"bias=%s severity=%s grade=%s gaps=%d pnlDiff=%.2f\n",
+		chapter10Audit.Dislocation.BiasDirection,
+		chapter10Audit.Dislocation.Severity,
+		chapter10Audit.Grade,
+		len(chapter10Audit.RealismGaps),
+		chapter10Audit.Dislocation.PnLDifference,
+	)
+	fmt.Println("eventDriven=" + chapter10Audit.EventDrivenClassification)
+	fmt.Println("next=" + chapter10Audit.NextPhase)
+	fmt.Println("wrote " + chapter10AuditJSONPath)
+	fmt.Println("wrote " + chapter10AuditMarkdownPath)
+	chapter10Models := realism.DefaultAggregateRealismModel()
+	chapter10ModelsReport := research.BuildChapter10RealismModelsReport(chapter10Models)
+	chapter10ModelsJSONPath := "research/chapter10_realism_models.json"
+	if err := research.WriteChapter10RealismModelsJSON(chapter10ModelsJSONPath, chapter10ModelsReport); err != nil {
+		log.Fatalf("write chapter 10 realism models json: %v", err)
+	}
+	chapter10ModelsMarkdownPath := "research/chapter10_realism_models.md"
+	if err := research.WriteChapter10RealismModelsMarkdown(chapter10ModelsMarkdownPath, chapter10ModelsReport); err != nil {
+		log.Fatalf("write chapter 10 realism models markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 10B SIMULATION REALISM MODELS ===")
+	fmt.Printf(
+		"overallRisk=%s latency=%s placeInLine=%s marketImpact=%s fill=%s warnings=%d\n",
+		chapter10Models.OverallRisk,
+		chapter10Models.Latency.Risk,
+		chapter10Models.PlaceInLine.Risk,
+		chapter10Models.MarketImpact.Risk,
+		chapter10Models.FillAssumption.Risk,
+		len(chapter10Models.Warnings),
+	)
+	fmt.Println("conclusion=Chapter 10B models realism assumptions only.")
+	fmt.Println("next=" + chapter10ModelsReport.NextPhase)
+	fmt.Println("wrote " + chapter10ModelsJSONPath)
+	fmt.Println("wrote " + chapter10ModelsMarkdownPath)
+	dataQuality := realism.CheckMarketDataQuality(primary.Candles, intervalToMillis(ResearchInterval))
+	dataParity := realism.DefaultHistoricalLiveParityCheck(primary.Venue, primary.Symbol, ResearchInterval)
+	dataQualityReport := research.BuildChapter10DataQualityReport(
+		primary.Venue,
+		primary.Symbol,
+		ResearchInterval,
+		realism.BuildDataQualityReport(dataQuality, dataParity),
+	)
+	chapter10DataQualityJSONPath := "research/chapter10_data_quality.json"
+	if err := research.WriteChapter10DataQualityJSON(chapter10DataQualityJSONPath, dataQualityReport); err != nil {
+		log.Fatalf("write chapter 10 data quality json: %v", err)
+	}
+	chapter10DataQualityMarkdownPath := "research/chapter10_data_quality.md"
+	if err := research.WriteChapter10DataQualityMarkdown(chapter10DataQualityMarkdownPath, dataQualityReport); err != nil {
+		log.Fatalf("write chapter 10 data quality markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 10C DATA QUALITY AUDIT ===")
+	fmt.Printf(
+		"candles=%d qualityRisk=%s parityRisk=%s warnings=%d recommendations=%d\n",
+		dataQualityReport.DataQuality.TotalCandlesChecked,
+		dataQualityReport.DataQuality.QualityRisk,
+		dataQualityReport.DataQuality.ParityRisk,
+		len(dataQualityReport.DataQuality.Warnings),
+		len(dataQualityReport.DataQuality.Recommendations),
+	)
+	fmt.Println("conclusion=Chapter 10C audits market data quality and historical/live parity only.")
+	fmt.Println("next=" + dataQualityReport.NextPhase)
+	fmt.Println("wrote " + chapter10DataQualityJSONPath)
+	fmt.Println("wrote " + chapter10DataQualityMarkdownPath)
+	riskEnforcementResults := runChapter6RiskEnforcement(primary, append(append(chapter2Results, chapter4SingleResults...), chapter5Results...))
+	riskEnforcementSummary := research.BuildChapter6RiskEnforcementSummary(riskEnforcementResults, removedCandidateSetFromPacket(chapter6Packet))
+	riskEnforcementCSVPath := "research/chapter6_risk_enforcement.csv"
+	if err := research.WriteChapter6RiskEnforcementCSV(riskEnforcementCSVPath, riskEnforcementSummary.Rows); err != nil {
+		log.Fatalf("write chapter 6 risk enforcement csv: %v", err)
+	}
+	riskEnforcementJSONPath := "research/chapter6_risk_enforcement_summary.json"
+	if err := research.WriteChapter6RiskEnforcementSummaryJSON(riskEnforcementJSONPath, riskEnforcementSummary); err != nil {
+		log.Fatalf("write chapter 6 risk enforcement summary json: %v", err)
+	}
+	riskEnforcementMarkdownPath := "research/chapter6_risk_enforcement.md"
+	if err := research.WriteChapter6RiskEnforcementMarkdown(riskEnforcementMarkdownPath, riskEnforcementSummary); err != nil {
+		log.Fatalf("write chapter 6 risk enforcement markdown: %v", err)
+	}
+	fmt.Println()
+	fmt.Println("=== CHAPTER 6B/6C RISK CONTROLS ENFORCEMENT ===")
+	fmt.Printf(
+		"strategies=%d tradesBefore=%d tradesAfter=%d violations=%d\n",
+		riskEnforcementSummary.Strategies,
+		riskEnforcementSummary.TradesBefore,
+		riskEnforcementSummary.TradesAfter,
+		riskEnforcementSummary.Violations,
+	)
+	fmt.Printf("improved=%d stillRejected=%d\n", len(riskEnforcementSummary.StrategiesImproved), len(riskEnforcementSummary.StrategiesRejected))
+	fmt.Println("conclusion=Risk controls are enforced in backtest/research only.")
+	fmt.Println("wrote " + riskEnforcementCSVPath)
+	fmt.Println("wrote " + riskEnforcementJSONPath)
+	fmt.Println("wrote " + riskEnforcementMarkdownPath)
 
 	_ = chapter4VenueRows
 	_ = chapter4VenueAnalyses
@@ -641,6 +1264,606 @@ func fetchVenueCandles(interval string, limit int) []venueCandles {
 		out = append(out, venueCandles{Venue: input.venue, Symbol: input.symbol, Candles: candles})
 	}
 	return out
+}
+
+func buildVWAPFeatures(candles []exchanges.Candle) []research.VWAPFeatureRow {
+	anchorTime := int64(0)
+	if len(candles) > 0 {
+		anchorTime = candles[0].StartTime
+	}
+	rows := research.BuildVWAPFeatureRows(candles, anchorTime, 5)
+	if err := research.WriteVWAPFeaturesCSV("research/vwap_features.csv", rows); err != nil {
+		log.Fatalf("write vwap features: %v", err)
+	}
+	return rows
+}
+
+func buildVWAPBehaviorStudy(candles []exchanges.Candle) ([]vwap.Interaction, []vwap.ReactionStudy, research.VWAPBehaviorSummary) {
+	interactions, reactions, magnetStats := research.BuildVWAPInteractions(candles)
+	if err := research.WriteVWAPInteractionCSV("research/vwap_interaction.csv", interactions); err != nil {
+		log.Fatalf("write vwap interaction: %v", err)
+	}
+	if err := research.WriteVWAPReactionsCSV("research/vwap_reactions.csv", reactions); err != nil {
+		log.Fatalf("write vwap reactions: %v", err)
+	}
+	summary := research.BuildVWAPBehaviorSummary(interactions, magnetStats)
+	if err := research.WriteVWAPBehaviorSummaryJSON("research/vwap_behavior_summary.json", summary); err != nil {
+		log.Fatalf("write vwap behavior summary: %v", err)
+	}
+	return interactions, reactions, summary
+}
+
+func fetchVWAPTimeframeCandles() map[string][]exchanges.Candle {
+	client := aster.NewClient(asterEnv("USER"), asterEnv("SIGNER"), asterEnv("PRIVATE_KEY"))
+	out := make(map[string][]exchanges.Candle)
+	for _, interval := range []string{"1m", "3m", "5m"} {
+		candles, err := client.GetCandles("BTCUSDT", interval, VWAPTimeframeCandleLimit)
+		if err != nil {
+			log.Printf("skip vwap timeframe %s: %v", interval, err)
+			continue
+		}
+		if len(candles) == 0 {
+			log.Printf("skip vwap timeframe %s: no candles returned", interval)
+			continue
+		}
+		out[interval] = candles
+	}
+	return out
+}
+
+func buildVWAPChapter3Study(candles []exchanges.Candle, candlesByTimeframe map[string][]exchanges.Candle) vwapChapter3Study {
+	contextRows := research.BuildContextFeatureRows(candles)
+	if err := research.WriteContextFeaturesCSV("research/context_features.csv", contextRows); err != nil {
+		log.Fatalf("write context features: %v", err)
+	}
+
+	timeframeRows := research.BuildTimeframeFeatureRows(candlesByTimeframe)
+	if err := research.WriteTimeframeFeaturesCSV("research/timeframe_features.csv", timeframeRows); err != nil {
+		log.Fatalf("write timeframe features: %v", err)
+	}
+
+	trendRows := research.BuildTrendAlignmentRows(candles)
+	if err := research.WriteTrendAlignmentCSV("research/trend_alignment.csv", trendRows); err != nil {
+		log.Fatalf("write trend alignment: %v", err)
+	}
+
+	summary := research.BuildVWAPChapter3Summary(contextRows)
+	if err := research.WriteVWAPChapter3SummaryJSON("research/chapter3_summary.json", summary); err != nil {
+		log.Fatalf("write vwap chapter 3 summary: %v", err)
+	}
+
+	return vwapChapter3Study{
+		ContextRows:   contextRows,
+		TimeframeRows: timeframeRows,
+		TrendRows:     trendRows,
+		Summary:       summary,
+	}
+}
+
+func buildPriceActionStudy(candles []exchanges.Candle) priceActionStudy {
+	rows := research.BuildPriceActionFeatureRows(candles)
+	if err := research.WritePriceActionFeaturesCSV("research/price_action_features.csv", rows); err != nil {
+		log.Fatalf("write price action features: %v", err)
+	}
+	summary := research.BuildPriceActionSummary(rows)
+	if err := research.WritePriceActionSummaryJSON("research/price_action_summary.json", summary); err != nil {
+		log.Fatalf("write price action summary: %v", err)
+	}
+	return priceActionStudy{Rows: rows, Summary: summary}
+}
+
+func buildPriceActionStrategyStudy(candles []exchanges.Candle) priceActionStrategyStudy {
+	rows := research.BuildPriceActionStrategyStudyRows(candles)
+	if err := research.WritePriceActionStrategyStudyCSV("research/price_action_strategy_study.csv", rows); err != nil {
+		log.Fatalf("write price action strategy study: %v", err)
+	}
+	summary := research.BuildPriceActionStrategySummary(len(candles), rows)
+	if err := research.WritePriceActionStrategySummaryJSON("research/price_action_strategy_summary.json", summary); err != nil {
+		log.Fatalf("write price action strategy summary: %v", err)
+	}
+	return priceActionStrategyStudy{Rows: rows, Summary: summary}
+}
+
+func buildPriceActionPhase3Study(candles []exchanges.Candle) priceActionPhase3Study {
+	rows := research.BuildPriceActionPhase3StudyRows(candles)
+	if err := research.WritePriceActionPhase3StudyCSV("research/price_action_phase3_study.csv", rows); err != nil {
+		log.Fatalf("write price action phase 3 study: %v", err)
+	}
+	summary := research.BuildPriceActionPhase3Summary(len(candles), rows)
+	if err := research.WritePriceActionPhase3SummaryJSON("research/price_action_phase3_summary.json", summary); err != nil {
+		log.Fatalf("write price action phase 3 summary: %v", err)
+	}
+	return priceActionPhase3Study{Rows: rows, Summary: summary}
+}
+
+func buildVolumeProfileStudy(candles []exchanges.Candle) volumeProfileStudy {
+	profile := volumeprofile.BuildProfile(candles, volumeprofile.DefaultBinConfig())
+	rows := research.BuildVolumeProfileFeatureRows(profile)
+	if err := research.WriteVolumeProfileFeaturesCSV("research/volume_profile_features.csv", rows); err != nil {
+		log.Fatalf("write volume profile features: %v", err)
+	}
+	summary := research.BuildVolumeProfileSummary([]volumeprofile.VolumeProfile{profile})
+	if err := research.WriteVolumeProfileSummaryJSON("research/volume_profile_summary.json", summary); err != nil {
+		log.Fatalf("write volume profile summary: %v", err)
+	}
+	return volumeProfileStudy{Profile: profile, Rows: rows, Summary: summary}
+}
+
+func buildScopedVolumeProfileStudy(candles []exchanges.Candle) scopedVolumeProfileStudy {
+	profiles := volumeprofile.BuildScopedProfiles(candles, volumeprofile.DefaultBinConfig())
+	rows := research.BuildScopedVolumeProfileFeatureRows(profiles)
+	if err := research.WriteScopedVolumeProfileFeaturesCSV("research/volume_profile_scoped_features.csv", rows); err != nil {
+		log.Fatalf("write scoped volume profile features: %v", err)
+	}
+	summary := research.BuildScopedVolumeProfileSummary(profiles)
+	if err := research.WriteScopedVolumeProfileSummaryJSON("research/volume_profile_scoped_summary.json", summary); err != nil {
+		log.Fatalf("write scoped volume profile summary: %v", err)
+	}
+	return scopedVolumeProfileStudy{Profiles: profiles, Rows: rows, Summary: summary}
+}
+
+func scopedPOC(profiles []volumeprofile.ScopedProfile, scope string) float64 {
+	profile, ok := volumeprofile.ScopedProfileByName(profiles, scope)
+	if !ok {
+		return 0
+	}
+	return profile.Profile.POC
+}
+
+func buildVolumeProfileShapeStudy(profiles []volumeprofile.ScopedProfile) volumeProfileShapeStudy {
+	rows := research.BuildVolumeProfileShapeStudyRows(profiles)
+	if err := research.WriteVolumeProfileShapeStudyCSV("research/volume_profile_shape_study.csv", rows); err != nil {
+		log.Fatalf("write volume profile shape study: %v", err)
+	}
+	summary := research.BuildVolumeProfileShapeSummary(rows)
+	if err := research.WriteVolumeProfileShapeSummaryJSON("research/volume_profile_shape_summary.json", summary); err != nil {
+		log.Fatalf("write volume profile shape summary: %v", err)
+	}
+	return volumeProfileShapeStudy{Rows: rows, Summary: summary}
+}
+
+func buildFlexibleVolumeProfileStudy(candles []exchanges.Candle, priceRows []research.PriceActionFeatureRow, strategyRows []research.PriceActionStrategyStudyRow, phase3Rows []research.PriceActionPhase3StudyRow) flexibleVolumeProfileStudy {
+	profiles := research.BuildFlexibleVolumeProfiles(candles, priceRows, strategyRows, phase3Rows)
+	rows := research.BuildFlexibleVolumeProfileRows(profiles)
+	if err := research.WriteFlexibleVolumeProfileCSV("research/flexible_volume_profile.csv", rows); err != nil {
+		log.Fatalf("write flexible volume profile csv: %v", err)
+	}
+	summary := research.BuildFlexibleVolumeProfileSummary(rows)
+	if err := research.WriteFlexibleVolumeProfileSummaryJSON("research/flexible_volume_profile_summary.json", summary); err != nil {
+		log.Fatalf("write flexible volume profile summary: %v", err)
+	}
+	return flexibleVolumeProfileStudy{Profiles: profiles, Rows: rows, Summary: summary}
+}
+
+func buildProfileAcceptanceQualityStudy() profileAcceptanceQualityStudy {
+	rows, summary, err := research.BuildProfileAcceptanceQualityFromFiles(
+		"research/flexible_volume_profile.csv",
+		"research/volume_profile_shape_study.csv",
+		"research/volume_profile_scoped_features.csv",
+	)
+	if err != nil {
+		log.Fatalf("build profile acceptance quality: %v", err)
+	}
+	if err := research.WriteProfileAcceptanceQualityCSV("research/profile_acceptance_quality.csv", rows); err != nil {
+		log.Fatalf("write profile acceptance quality csv: %v", err)
+	}
+	if err := research.WriteProfileAcceptanceQualitySummaryJSON("research/profile_acceptance_quality_summary.json", summary); err != nil {
+		log.Fatalf("write profile acceptance quality summary: %v", err)
+	}
+	return profileAcceptanceQualityStudy{Rows: rows, Summary: summary}
+}
+
+func buildVolumeSetupAccumulationStudy() volumeSetupAccumulationStudy {
+	rows, summary, err := research.BuildVolumeSetupAccumulationFromFiles(
+		"research/flexible_volume_profile.csv",
+		"research/price_action_features.csv",
+		"research/price_action_strategy_study.csv",
+		"research/volume_profile_scoped_features.csv",
+		"research/profile_acceptance_quality.csv",
+		volumeprofile.DefaultAccumulationSetupConfig(),
+	)
+	if err != nil {
+		log.Fatalf("build volume setup accumulation: %v", err)
+	}
+	if err := research.WriteVolumeSetupAccumulationCSV("research/volume_setup_accumulation.csv", rows); err != nil {
+		log.Fatalf("write volume setup accumulation csv: %v", err)
+	}
+	if err := research.WriteVolumeSetupAccumulationSummaryJSON("research/volume_setup_accumulation_summary.json", summary); err != nil {
+		log.Fatalf("write volume setup accumulation summary: %v", err)
+	}
+	return volumeSetupAccumulationStudy{Rows: rows, Summary: summary}
+}
+
+func buildVolumeSetupAccumulationQualityStudy() volumeSetupAccumulationQualityStudy {
+	rows, summary, err := research.BuildVolumeSetupAccumulationQualityFromFile("research/volume_setup_accumulation.csv")
+	if err != nil {
+		log.Fatalf("build volume setup accumulation quality: %v", err)
+	}
+	if err := research.WriteVolumeSetupAccumulationQualityCSV("research/volume_setup_accumulation_quality.csv", rows); err != nil {
+		log.Fatalf("write volume setup accumulation quality csv: %v", err)
+	}
+	if err := research.WriteVolumeSetupAccumulationQualitySummaryJSON("research/volume_setup_accumulation_quality_summary.json", summary); err != nil {
+		log.Fatalf("write volume setup accumulation quality summary: %v", err)
+	}
+	if err := research.WriteVolumeSetupAccumulationQualityMarkdown("research/volume_setup_accumulation_quality.md", rows, summary); err != nil {
+		log.Fatalf("write volume setup accumulation quality markdown: %v", err)
+	}
+	return volumeSetupAccumulationQualityStudy{Rows: rows, Summary: summary}
+}
+
+func buildVolumeSetupTrendStudy() volumeSetupTrendStudy {
+	rows, summary, err := research.BuildVolumeSetupTrendFromFiles(
+		"research/price_action_features.csv",
+		"research/price_action_strategy_study.csv",
+		"research/price_action_phase3_study.csv",
+		"research/flexible_volume_profile.csv",
+		"research/volume_profile_scoped_features.csv",
+		"research/profile_acceptance_quality.csv",
+		volumeprofile.DefaultTrendSetupConfig(),
+	)
+	if err != nil {
+		log.Fatalf("build volume setup trend: %v", err)
+	}
+	if err := research.WriteVolumeSetupTrendCSV("research/volume_setup_trend.csv", rows); err != nil {
+		log.Fatalf("write volume setup trend csv: %v", err)
+	}
+	if err := research.WriteVolumeSetupTrendSummaryJSON("research/volume_setup_trend_summary.json", summary); err != nil {
+		log.Fatalf("write volume setup trend summary: %v", err)
+	}
+	return volumeSetupTrendStudy{Rows: rows, Summary: summary}
+}
+
+func buildVolumeSetupTrendQualityStudy() volumeSetupTrendQualityStudy {
+	rows, summary, err := research.BuildVolumeSetupTrendQualityFromFile("research/volume_setup_trend.csv")
+	if err != nil {
+		log.Fatalf("build volume setup trend quality: %v", err)
+	}
+	if err := research.WriteVolumeSetupTrendQualityCSV("research/volume_setup_trend_quality.csv", rows); err != nil {
+		log.Fatalf("write volume setup trend quality csv: %v", err)
+	}
+	if err := research.WriteVolumeSetupTrendQualitySummaryJSON("research/volume_setup_trend_quality_summary.json", summary); err != nil {
+		log.Fatalf("write volume setup trend quality summary: %v", err)
+	}
+	if err := research.WriteVolumeSetupTrendQualityMarkdown("research/volume_setup_trend_quality.md", rows, summary); err != nil {
+		log.Fatalf("write volume setup trend quality markdown: %v", err)
+	}
+	return volumeSetupTrendQualityStudy{Rows: rows, Summary: summary}
+}
+
+func buildVolumeSetupRejectionStudy() volumeSetupRejectionStudy {
+	rows, summary, err := research.BuildVolumeSetupRejectionFromFiles(
+		"research/price_action_features.csv",
+		"research/price_action_phase3_study.csv",
+		"research/flexible_volume_profile.csv",
+		"research/volume_profile_scoped_features.csv",
+		"research/profile_acceptance_quality.csv",
+		"research/vwap_features.csv",
+		"research/context_features.csv",
+		"research/context_features_l2.csv",
+		volumeprofile.DefaultRejectionSetupConfig(),
+	)
+	if err != nil {
+		log.Fatalf("build volume setup rejection: %v", err)
+	}
+	if err := research.WriteVolumeSetupRejectionCSV("research/volume_setup_rejection.csv", rows); err != nil {
+		log.Fatalf("write volume setup rejection csv: %v", err)
+	}
+	if err := research.WriteVolumeSetupRejectionSummaryJSON("research/volume_setup_rejection_summary.json", summary); err != nil {
+		log.Fatalf("write volume setup rejection summary: %v", err)
+	}
+	return volumeSetupRejectionStudy{Rows: rows, Summary: summary}
+}
+
+func buildVolumeSetupRejectionQualityStudy() volumeSetupRejectionQualityStudy {
+	rows, summary, err := research.BuildVolumeSetupRejectionQualityFromFile("research/volume_setup_rejection.csv")
+	if err != nil {
+		log.Fatalf("build volume setup rejection quality: %v", err)
+	}
+	if err := research.WriteVolumeSetupRejectionQualityCSV("research/volume_setup_rejection_quality.csv", rows); err != nil {
+		log.Fatalf("write volume setup rejection quality csv: %v", err)
+	}
+	if err := research.WriteVolumeSetupRejectionQualitySummaryJSON("research/volume_setup_rejection_quality_summary.json", summary); err != nil {
+		log.Fatalf("write volume setup rejection quality summary: %v", err)
+	}
+	if err := research.WriteVolumeSetupRejectionQualityMarkdown("research/volume_setup_rejection_quality.md", rows, summary); err != nil {
+		log.Fatalf("write volume setup rejection quality markdown: %v", err)
+	}
+	return volumeSetupRejectionQualityStudy{Rows: rows, Summary: summary}
+}
+
+func buildVolumeSetupReversalStudy() volumeSetupReversalStudy {
+	rows, summary, err := research.BuildVolumeSetupReversalFromFiles(
+		"research/volume_setup_rejection.csv",
+		"research/volume_setup_rejection_quality.csv",
+		"research/price_action_phase3_study.csv",
+		"research/flexible_volume_profile.csv",
+		"research/volume_profile_scoped_features.csv",
+		"research/vwap_features.csv",
+		"research/context_features.csv",
+		volumeprofile.DefaultReversalSetupConfig(),
+	)
+	if err != nil {
+		log.Fatalf("build volume setup reversal: %v", err)
+	}
+	if err := research.WriteVolumeSetupReversalCSV("research/volume_setup_reversal.csv", rows); err != nil {
+		log.Fatalf("write volume setup reversal csv: %v", err)
+	}
+	if err := research.WriteVolumeSetupReversalSummaryJSON("research/volume_setup_reversal_summary.json", summary); err != nil {
+		log.Fatalf("write volume setup reversal summary: %v", err)
+	}
+	return volumeSetupReversalStudy{Rows: rows, Summary: summary}
+}
+
+func buildVolumeSetupReversalQualityStudy() volumeSetupReversalQualityStudy {
+	rows, summary, err := research.BuildVolumeSetupReversalQualityFromFile("research/volume_setup_reversal.csv")
+	if err != nil {
+		log.Fatalf("build volume setup reversal quality: %v", err)
+	}
+	if err := research.WriteVolumeSetupReversalQualityCSV("research/volume_setup_reversal_quality.csv", rows); err != nil {
+		log.Fatalf("write volume setup reversal quality csv: %v", err)
+	}
+	if err := research.WriteVolumeSetupReversalQualitySummaryJSON("research/volume_setup_reversal_quality_summary.json", summary); err != nil {
+		log.Fatalf("write volume setup reversal quality summary: %v", err)
+	}
+	if err := research.WriteVolumeSetupReversalQualityMarkdown("research/volume_setup_reversal_quality.md", rows, summary); err != nil {
+		log.Fatalf("write volume setup reversal quality markdown: %v", err)
+	}
+	return volumeSetupReversalQualityStudy{Rows: rows, Summary: summary}
+}
+
+func buildVolumeSetupComparisonStudy() volumeSetupComparisonStudy {
+	rows, summary, err := research.BuildVolumeSetupComparisonFromFiles(
+		"research/volume_setup_accumulation.csv",
+		"research/volume_setup_trend.csv",
+		"research/volume_setup_rejection.csv",
+		"research/volume_setup_reversal.csv",
+	)
+	if err != nil {
+		log.Fatalf("build volume setup comparison: %v", err)
+	}
+	if err := research.WriteVolumeSetupComparisonCSV("research/volume_setup_comparison.csv", rows); err != nil {
+		log.Fatalf("write volume setup comparison csv: %v", err)
+	}
+	if err := research.WriteVolumeSetupComparisonJSON("research/volume_setup_comparison.json", summary); err != nil {
+		log.Fatalf("write volume setup comparison json: %v", err)
+	}
+	if err := research.WriteVolumeSetupComparisonMarkdown("research/volume_setup_comparison.md", rows, summary); err != nil {
+		log.Fatalf("write volume setup comparison markdown: %v", err)
+	}
+	return volumeSetupComparisonStudy{Rows: rows, Summary: summary}
+}
+
+func buildSetupFeatureLabelExport(candles []exchanges.Candle) setupFeatureLabelStudy {
+	rows, summary, err := research.BuildSetupFeatureLabelExport(research.SetupFeatureLabelPaths{
+		ReversalPath:     "research/volume_setup_reversal.csv",
+		AccumulationPath: "research/volume_setup_accumulation.csv",
+		TrendPath:        "research/volume_setup_trend.csv",
+		RejectionPath:    "research/volume_setup_rejection.csv",
+		VWAPPath:         "research/vwap_features.csv",
+		ContextPath:      "research/context_features.csv",
+		ScopedPath:       "research/volume_profile_scoped_features.csv",
+		PriceActionPath:  "research/price_action_features.csv",
+	}, candles)
+	if err != nil {
+		log.Fatalf("build setup feature label export: %v", err)
+	}
+	if err := research.WriteSetupFeatureLabelCSV("research/setup_features_labels.csv", rows); err != nil {
+		log.Fatalf("write setup feature label csv: %v", err)
+	}
+	if err := research.WriteSetupLabelsSummaryJSON("research/setup_labels_summary.json", summary); err != nil {
+		log.Fatalf("write setup labels summary: %v", err)
+	}
+	return setupFeatureLabelStudy{Rows: rows, Summary: summary}
+}
+
+func buildInstrumentUniverseStudy(orderBookRows []research.OrderBookFeatureRow, venues []venueCandles) instrumentUniverseStudy {
+	candleCounts := map[string]int{}
+	for _, venue := range venues {
+		candleCounts[venue.Venue+":"+venue.Symbol] = len(venue.Candles)
+	}
+	rows := research.BuildInstrumentUniverse(orderBookRows, candleCounts)
+	summary := research.BuildInstrumentUniverseSummary(rows)
+	if err := research.WriteInstrumentUniverseCSV("research/instrument_universe.csv", rows); err != nil {
+		log.Fatalf("write instrument universe csv: %v", err)
+	}
+	if err := research.WriteInstrumentUniverseSummaryJSON("research/instrument_universe_summary.json", summary); err != nil {
+		log.Fatalf("write instrument universe summary: %v", err)
+	}
+	return instrumentUniverseStudy{Rows: rows, Summary: summary}
+}
+
+func buildVolumeProfileFinalBookPacket() volumeProfileFinalBookStudy {
+	archived := archivedResearchFiles()
+	packet := research.BuildVolumeProfileFinalBookPacket(archived)
+	if err := research.WriteVolumeProfileFinalBookPacketJSON("research/volume_profile_final_book_packet.json", packet); err != nil {
+		log.Fatalf("write volume profile final packet json: %v", err)
+	}
+	if err := research.WriteVolumeProfileFinalBookPacketMarkdown("research/volume_profile_final_book_packet.md", packet); err != nil {
+		log.Fatalf("write volume profile final packet markdown: %v", err)
+	}
+	return volumeProfileFinalBookStudy{Packet: packet}
+}
+
+func archivedResearchFiles() []string {
+	entries, err := os.ReadDir("research/archive")
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		out = append(out, "research/archive/"+entry.Name())
+	}
+	sort.Strings(out)
+	return out
+}
+
+func buildVolumeProfileBookCompletionPacket() volumeProfileBookCompletionStudy {
+	packet := research.BuildVolumeProfileBookCompletionPacket()
+	if err := research.WriteVolumeProfileBookCompletionPacketJSON("research/volume_profile_book_completion_packet.json", packet); err != nil {
+		log.Fatalf("write volume profile book completion packet json: %v", err)
+	}
+	if err := research.WriteVolumeProfileBookCompletionPacketMarkdown("research/volume_profile_book_completion_packet.md", packet); err != nil {
+		log.Fatalf("write volume profile book completion packet markdown: %v", err)
+	}
+	return volumeProfileBookCompletionStudy{Packet: packet}
+}
+
+func fetchHyperliquidL2Snapshot(symbol string) *orderbook.OrderBookSnapshot {
+	snapshot, err := hyperliquid.GetMainnetL2OrderBookSnapshot(symbol)
+	if err != nil {
+		log.Printf("skip hyperliquid mainnet l2 snapshot %s: %v", symbol, err)
+		return nil
+	}
+	return snapshot
+}
+
+func fetchMultiVenueL2Snapshots() []orderbook.OrderBookSnapshot {
+	out := make([]orderbook.OrderBookSnapshot, 0, 3)
+
+	if snapshot := fetchHyperliquidL2Snapshot("BTC"); snapshot != nil {
+		out = append(out, *snapshot)
+	}
+
+	asterSnapshot, err := aster.GetMainnetOrderBook("BTCUSDT")
+	if err != nil {
+		log.Printf("skip aster mainnet l2 snapshot BTCUSDT: %v", err)
+	} else {
+		out = append(out, asterSnapshot)
+	}
+
+	lighterSnapshot, err := lighter.GetMainnetOrderBook("BTC")
+	if err != nil {
+		log.Printf("skip lighter mainnet l2 snapshot BTC: %v", err)
+	} else {
+		out = append(out, lighterSnapshot)
+	}
+
+	return out
+}
+
+func snapshotByVenue(snapshots []orderbook.OrderBookSnapshot, venue string) *orderbook.OrderBookSnapshot {
+	for i := range snapshots {
+		if snapshots[i].Venue == venue {
+			return &snapshots[i]
+		}
+	}
+	return nil
+}
+
+func printHyperliquidL2Snapshot(snapshot *orderbook.OrderBookSnapshot) {
+	fmt.Println("=== HYPERLIQUID L2 SNAPSHOT ===")
+	if snapshot == nil {
+		fmt.Println("valid=false")
+		fmt.Println()
+		return
+	}
+
+	valid := orderbook.ValidateSnapshot(*snapshot) == nil
+	fmt.Printf("symbol=%s\n", snapshot.Symbol)
+	fmt.Printf("bestBid=%s\n", orderbook.BestBid(*snapshot).Price)
+	fmt.Printf("bestAsk=%s\n", orderbook.BestAsk(*snapshot).Price)
+	fmt.Printf("spread=%.8f\n", orderbook.Spread(*snapshot))
+	fmt.Printf("spreadPct=%.8f\n", orderbook.SpreadPct(*snapshot))
+	fmt.Printf("mid=%.8f\n", orderbook.Mid(*snapshot))
+	fmt.Printf("bidDepth1Pct=%.8f\n", orderbook.BidDepthWithinPct(*snapshot, 1))
+	fmt.Printf("askDepth1Pct=%.8f\n", orderbook.AskDepthWithinPct(*snapshot, 1))
+	fmt.Printf("imbalance1Pct=%.8f\n", orderbook.Imbalance(*snapshot, 1))
+	fmt.Printf("valid=%t\n", valid)
+	fmt.Println()
+}
+
+func printMultiVenueL2Summary(snapshots []orderbook.OrderBookSnapshot) {
+	fmt.Println("=== MULTI VENUE L2 SUMMARY ===")
+	if len(snapshots) == 0 {
+		fmt.Println("snapshots=0")
+		fmt.Println()
+		return
+	}
+	for _, snapshot := range snapshots {
+		fmt.Printf("venue=%s\n", snapshot.Venue)
+		fmt.Printf("spreadPct=%.8f\n", orderbook.SpreadPct(snapshot))
+		fmt.Printf("imbalance=%.8f\n", orderbook.Imbalance(snapshot, 1))
+		fmt.Printf("valid=%t\n", orderbook.ValidateSnapshot(snapshot) == nil)
+		fmt.Println()
+	}
+}
+
+func candlesByVenue(venues []venueCandles) map[string][]exchanges.Candle {
+	out := make(map[string][]exchanges.Candle, len(venues))
+	for _, venue := range venues {
+		out[venue.Venue] = venue.Candles
+	}
+	return out
+}
+
+func buildOrderBookResearchRows(snapshots []orderbook.OrderBookSnapshot, venueCandles map[string][]exchanges.Candle) orderBookResearchRows {
+	rows := orderBookResearchRows{}
+	for _, snapshot := range snapshots {
+		rows.Snapshots = append(rows.Snapshots, snapshot)
+		rows.Features = append(rows.Features, research.BuildOrderBookFeatureRow(snapshot))
+		rows.VWAPInteraction = append(rows.VWAPInteraction, research.BuildVWAPL2InteractionRow(snapshot, venueCandles[snapshot.Venue]))
+	}
+	if err := research.WriteOrderBookFeaturesCSV("research/orderbook_features.csv", rows.Features); err != nil {
+		log.Fatalf("write orderbook features: %v", err)
+	}
+	if err := research.WriteVWAPL2InteractionCSV("research/vwap_l2_interaction.csv", rows.VWAPInteraction); err != nil {
+		log.Fatalf("write vwap l2 interaction: %v", err)
+	}
+	if err := research.WriteOrderBookFeaturesCSV("research/multi_venue_orderbook_features.csv", rows.Features); err != nil {
+		log.Fatalf("write multi venue orderbook features: %v", err)
+	}
+	if err := research.WriteVWAPL2InteractionCSV("research/multi_venue_vwap_l2_interaction.csv", rows.VWAPInteraction); err != nil {
+		log.Fatalf("write multi venue vwap l2 interaction: %v", err)
+	}
+	return rows
+}
+
+func buildVWAPL2RefreshStudy(venues []venueCandles, snapshots []orderbook.OrderBookSnapshot) vwapL2RefreshStudy {
+	candles := candlesByVenue(venues)
+	inputs := make([]research.VWAPL2RefreshInput, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		inputs = append(inputs, research.VWAPL2RefreshInput{
+			Venue:    snapshot.Venue,
+			Symbol:   snapshot.Symbol,
+			Candles:  candles[snapshot.Venue],
+			Snapshot: snapshot,
+		})
+	}
+
+	result := research.BuildVWAPL2Refresh(inputs)
+	if err := research.WriteVWAPL2FeaturesCSV("research/vwap_features_l2.csv", result.FeatureRows); err != nil {
+		log.Fatalf("write vwap l2 features: %v", err)
+	}
+	if err := research.WriteContextL2FeaturesCSV("research/context_features_l2.csv", result.ContextRows); err != nil {
+		log.Fatalf("write context l2 features: %v", err)
+	}
+	if err := research.WriteVWAPL2BehaviorSummaryJSON("research/vwap_behavior_l2_summary.json", result.Summary); err != nil {
+		log.Fatalf("write vwap l2 behavior summary: %v", err)
+	}
+
+	return vwapL2RefreshStudy{
+		FeatureRows: result.FeatureRows,
+		ContextRows: result.ContextRows,
+		Summary:     result.Summary,
+	}
+}
+
+func buildL2SnapshotAnalysis() (l2recorder.SnapshotAnalysis, bool) {
+	analysis, err := l2recorder.AnalyzeSnapshotCSV("data/l2_snapshots/l2_snapshots.csv")
+	if err != nil {
+		log.Printf("skip l2 snapshot analysis: %v", err)
+		return l2recorder.SnapshotAnalysis{}, false
+	}
+	if err := research.WriteL2SnapshotAnalysisJSON("research/l2_snapshot_analysis.json", analysis); err != nil {
+		log.Fatalf("write l2 snapshot analysis json: %v", err)
+	}
+	if err := research.WriteL2SnapshotAnalysisMarkdown("research/l2_snapshot_analysis.md", analysis); err != nil {
+		log.Fatalf("write l2 snapshot analysis markdown: %v", err)
+	}
+	return analysis, true
 }
 
 func runChapter2(primary venueCandles, frame series.Frame) []strategyBacktestResult {
@@ -841,6 +2064,39 @@ func runStrategies(candles []exchanges.Candle, strategies []strategyRun, venue s
 		})
 	}
 	return results
+}
+
+func runChapter6RiskEnforcement(primary venueCandles, results []strategyBacktestResult) []backtest.RiskEnforcedResult {
+	controlConfig := risk.RiskControlConfig{
+		MaxTradesPerDay:           4,
+		MaxTradeSize:              1,
+		MaxNotional:               100,
+		MaxHoldBars:               48,
+		StopLossPct:               0.01,
+		MaxVolumeParticipationPct: 1,
+		EnableViolationLogging:    true,
+	}
+	config := backtest.Config{
+		Venue:           primary.Venue,
+		Symbol:          primary.Symbol,
+		Interval:        ResearchInterval,
+		StartingBalance: 10000,
+		FixedNotional:   100,
+	}
+
+	out := make([]backtest.RiskEnforcedResult, 0, len(results))
+	for _, result := range results {
+		out = append(out, backtest.RunRiskEnforcedWithSignals(primary.Candles, result.Signals, config, controlConfig, result.Name))
+	}
+	return out
+}
+
+func removedCandidateSetFromPacket(packet research.Chapter6RiskPacket) map[string]bool {
+	out := make(map[string]bool, len(packet.RemovedFromCandidates))
+	for _, row := range packet.RemovedFromCandidates {
+		out[row.Strategy] = true
+	}
+	return out
 }
 
 func researchLimits() risk.Limits {
@@ -1086,6 +2342,23 @@ func candleInterval(times []int64) time.Duration {
 		}
 	}
 	return 0
+}
+
+func intervalToMillis(interval string) int64 {
+	switch interval {
+	case "1m":
+		return int64(time.Minute / time.Millisecond)
+	case "5m":
+		return int64(5 * time.Minute / time.Millisecond)
+	case "15m":
+		return int64(15 * time.Minute / time.Millisecond)
+	case "1h":
+		return int64(time.Hour / time.Millisecond)
+	case "1d":
+		return int64(24 * time.Hour / time.Millisecond)
+	default:
+		return 0
+	}
 }
 
 func holdCandles(openedAt time.Time, closedAt time.Time, interval time.Duration) int {
