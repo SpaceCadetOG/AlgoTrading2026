@@ -1,0 +1,670 @@
+{
+  "playbooks": [
+    {
+      "name": "VP Reversal + OF Absorption",
+      "directionBias": "both",
+      "setup": "Failed auction or sharp rejection at VAH, VAL, HVN, or POC with profile structure showing reversal context.",
+      "entry": {
+        "name": "Reversal Confirmation Entry",
+        "sourceBook": "volume_profile",
+        "entryType": "confirmation_retest",
+        "trigger": "Enter after rejection confirms and absorption, big limit order behavior, or cumulative delta divergence validates the reversal.",
+        "confirmationRequired": [
+          "Rejection candle or failed auction confirmation",
+          "Absorption, big limit order, or cumulative delta divergence"
+        ],
+        "invalidIf": [
+          "Price accepts beyond the failed level",
+          "Order flow confirms the original move instead of the reversal"
+        ],
+        "offsetBps": 5
+      },
+      "stop": {
+        "name": "Failed Auction Protective Stop",
+        "sourceBook": "volume_profile",
+        "stopType": "volume_based",
+        "placement": "Beyond the failed auction extreme or rejection wick, using the farthest meaningful barrier between profile edge and swing.",
+        "bufferBps": 8,
+        "catastrophicMultiplier": 1.5
+      },
+      "target": {
+        "name": "Profile Reversal Ladder",
+        "sourceBook": "volume_profile",
+        "targetType": "volume_profile_ladder",
+        "target1": "POC",
+        "target2": "Opposite value area boundary",
+        "target3": "Next HVN with trailing runner",
+        "minRR": 1.25,
+        "partialPct1": 0.5,
+        "partialPct2": 0.3,
+        "partialPct3": 0.2
+      },
+      "management": {
+        "name": "Reversal Risk Compression",
+        "sourceBook": "volume_profile",
+        "breakEvenAfter": "TP1 or first clean reaction away from the failed level",
+        "trailAfter": "TP2 once reversal expands beyond value",
+        "earlyExitIf": [
+          "Price accepts beyond the failed level",
+          "Follow-through dies immediately after entry"
+        ],
+        "forceFlatIf": [
+          "Funding hazard or macro hazard is near",
+          "Opposite absorption appears before TP1"
+        ]
+      },
+      "risk": {
+        "name": "Fixed Fractional Book Risk",
+        "riskPerTradePct": 0.5,
+        "maxDailyLossPct": 2,
+        "maxOpenPositions": 3,
+        "maxTradesPerSymbolPerDay": 2,
+        "minRewardToRisk": 1.25,
+        "fundingHazardBlock": true
+      },
+      "requiredContext": [
+        "Major profile level",
+        "Failed auction or strong rejection",
+        "Nearby POC, HVN, VAH, or VAL"
+      ],
+      "requiredConfirmations": [
+        "Absorption or big limit order",
+        "Cumulative delta divergence or failed continuation read"
+      ],
+      "rejectIf": [
+        "Reward-to-risk is below minimum",
+        "Stop cannot be placed behind a clear failed level"
+      ]
+    },
+    {
+      "name": "VP Accumulation + OF Volume Cluster",
+      "directionBias": "both",
+      "setup": "Sideways accumulation zone forms with a POC or HVN inside the range and a breakout/retest context around a volume cluster.",
+      "entry": {
+        "name": "Accumulation Breakout Retest",
+        "sourceBook": "volume_profile",
+        "entryType": "breakout_retest",
+        "trigger": "Enter after breakout from accumulation and retest of POC, HVN, or cluster confirms hold from the new side.",
+        "confirmationRequired": [
+          "Breakout from accumulation range",
+          "Retest hold at POC, HVN, or volume cluster"
+        ],
+        "invalidIf": [
+          "Price accepts back into the accumulation range",
+          "Retest slices through the level without reaction"
+        ],
+        "offsetBps": 5
+      },
+      "stop": {
+        "name": "Accumulation Range Stop",
+        "sourceBook": "volume_profile",
+        "stopType": "combined_barrier",
+        "placement": "Beyond the opposite side of the accumulation range or behind VAL for longs and VAH for shorts, with a small basis-point buffer.",
+        "bufferBps": 10,
+        "catastrophicMultiplier": 1.25
+      },
+      "target": {
+        "name": "Accumulation Expansion Targets",
+        "sourceBook": "volume_profile",
+        "targetType": "profile_expansion",
+        "target1": "Nearest HVN or first profile barrier",
+        "target2": "Next major profile level",
+        "target3": "Trend runner if expansion persists",
+        "minRR": 1.25,
+        "partialPct1": 0.4,
+        "partialPct2": 0.35,
+        "partialPct3": 0.25
+      },
+      "management": {
+        "name": "Accumulation Hold Management",
+        "sourceBook": "volume_profile",
+        "breakEvenAfter": "TP1",
+        "trailAfter": "New HVNs form in trend direction",
+        "earlyExitIf": [
+          "Price accepts back into the accumulation range",
+          "Retest level loses cluster support"
+        ],
+        "forceFlatIf": [
+          "Range acceptance returns with no continuation"
+        ]
+      },
+      "risk": {
+        "name": "Fixed Fractional Book Risk",
+        "riskPerTradePct": 0.5,
+        "maxDailyLossPct": 2,
+        "maxOpenPositions": 3,
+        "maxTradesPerSymbolPerDay": 2,
+        "minRewardToRisk": 1.25,
+        "fundingHazardBlock": true
+      },
+      "requiredContext": [
+        "Sideways accumulation zone",
+        "Accumulation POC or HVN",
+        "Volume cluster near the retest"
+      ],
+      "requiredConfirmations": [
+        "Breakout plus retest hold",
+        "Volume cluster acting as support or resistance"
+      ],
+      "rejectIf": [
+        "Profile level is unclear",
+        "Reward-to-risk is below minimum"
+      ]
+    },
+    {
+      "name": "VP Trend + VWAP Pullback + Aggressive Delta",
+      "directionBias": "both",
+      "setup": "Trend profile is directional, VWAP is aligned with the move, and pullback reaches a profile level, VWAP, or prior acceptance zone.",
+      "entry": {
+        "name": "Trend Pullback Continuation",
+        "sourceBook": "volume_profile_vwap_orderflow",
+        "entryType": "pullback_continuation",
+        "trigger": "Enter after pullback to VWAP, deviation, or profile level holds and aggressive delta resumes in the trend direction.",
+        "confirmationRequired": [
+          "Trend direction remains intact",
+          "Aggressive delta resumes with trend",
+          "VWAP or profile support/resistance reaction"
+        ],
+        "invalidIf": [
+          "Price accepts back into prior value",
+          "Delta flips against continuation at the retest"
+        ],
+        "offsetBps": 4
+      },
+      "stop": {
+        "name": "Trend Pullback Barrier Stop",
+        "sourceBook": "vwap",
+        "stopType": "combined_barrier",
+        "placement": "Beyond the pullback swing, VWAP barrier, or profile level that should hold, whichever is farthest and structurally cleanest.",
+        "bufferBps": 6,
+        "catastrophicMultiplier": 1.25
+      },
+      "target": {
+        "name": "Trend Continuation Ladder",
+        "sourceBook": "volume_profile_vwap",
+        "targetType": "hybrid_rr_profile",
+        "target1": "Fixed 1R",
+        "target2": "Next HVN or VWAP deviation",
+        "target3": "Trailing trend target",
+        "minRR": 1.25,
+        "partialPct1": 0.35,
+        "partialPct2": 0.35,
+        "partialPct3": 0.3
+      },
+      "management": {
+        "name": "Trend Continuation Management",
+        "sourceBook": "vwap",
+        "breakEvenAfter": "TP1",
+        "trailAfter": "TP1 or TP2 when continuation proves itself",
+        "earlyExitIf": [
+          "Momentum fades",
+          "Delta divergence appears against the trade",
+          "Price accepts back into prior value"
+        ],
+        "forceFlatIf": [
+          "Funding hazard near decision zone"
+        ]
+      },
+      "risk": {
+        "name": "Fixed Fractional Book Risk",
+        "riskPerTradePct": 0.5,
+        "maxDailyLossPct": 2,
+        "maxOpenPositions": 3,
+        "maxTradesPerSymbolPerDay": 2,
+        "minRewardToRisk": 1.25,
+        "fundingHazardBlock": true
+      },
+      "requiredContext": [
+        "Directional trend profile",
+        "VWAP alignment",
+        "Pullback into profile or VWAP support/resistance"
+      ],
+      "requiredConfirmations": [
+        "Aggressive delta with trend",
+        "Continuation candle or reaction confirmation"
+      ],
+      "rejectIf": [
+        "VWAP and profile disagree",
+        "Reward-to-risk is below minimum"
+      ]
+    },
+    {
+      "name": "VP Rejection + Cumulative Delta Divergence",
+      "directionBias": "both",
+      "setup": "Price tests VAH, VAL, HVN, LVN, or POC and rejects, while cumulative delta diverges from price at the rejection point.",
+      "entry": {
+        "name": "Rejection Divergence Entry",
+        "sourceBook": "volume_profile_orderflow",
+        "entryType": "rejection_confirmation",
+        "trigger": "Enter after the rejection candle confirms and cumulative delta divergence shows failed participation in the tested direction.",
+        "confirmationRequired": [
+          "Rejection candle confirmation",
+          "Cumulative delta divergence"
+        ],
+        "invalidIf": [
+          "Price accepts past the rejected level",
+          "Divergence disappears on the next push"
+        ],
+        "offsetBps": 5
+      },
+      "stop": {
+        "name": "Rejection Wick Stop",
+        "sourceBook": "volume_profile",
+        "stopType": "volume_based",
+        "placement": "Beyond the rejection wick or failed auction extreme, with a buffer beyond the level that should hold.",
+        "bufferBps": 8,
+        "catastrophicMultiplier": 1.5
+      },
+      "target": {
+        "name": "Rejection Rotation Targets",
+        "sourceBook": "volume_profile",
+        "targetType": "rotation_targets",
+        "target1": "POC",
+        "target2": "Opposite value area boundary",
+        "target3": "Next HVN beyond value",
+        "minRR": 1.25,
+        "partialPct1": 0.45,
+        "partialPct2": 0.35,
+        "partialPct3": 0.2
+      },
+      "management": {
+        "name": "Rejection Rotation Management",
+        "sourceBook": "volume_profile",
+        "breakEvenAfter": "TP1",
+        "trailAfter": "Only after TP2 if rotation expands",
+        "earlyExitIf": [
+          "Price accepts beyond the rejected level",
+          "No reaction away from POC after entry"
+        ],
+        "forceFlatIf": [
+          "Macro or funding hazard is near while still in local value"
+        ]
+      },
+      "risk": {
+        "name": "Fixed Fractional Book Risk",
+        "riskPerTradePct": 0.5,
+        "maxDailyLossPct": 2,
+        "maxOpenPositions": 3,
+        "maxTradesPerSymbolPerDay": 2,
+        "minRewardToRisk": 1.25,
+        "fundingHazardBlock": true
+      },
+      "requiredContext": [
+        "VAH, VAL, HVN, LVN, or POC test",
+        "Strong rejection"
+      ],
+      "requiredConfirmations": [
+        "Cumulative delta divergence",
+        "Rejection candle or retest fail"
+      ],
+      "rejectIf": [
+        "Reward-to-risk is below minimum",
+        "Rejected level is not structurally clear"
+      ]
+    },
+    {
+      "name": "Unfinished Business Revisit",
+      "directionBias": "both",
+      "setup": "An unfinished high or low exists and price later revisits that level, creating a chance to trade the revisit after confirmation rather than the first print.",
+      "entry": {
+        "name": "UB Revisit Confirmation",
+        "sourceBook": "order_flow",
+        "entryType": "revisit_confirmation",
+        "trigger": "Enter only after the unfinished level is revisited and held or rejected with clear response.",
+        "confirmationRequired": [
+          "Revisit of unfinished high or low",
+          "Reaction candle or supporting order-flow response"
+        ],
+        "invalidIf": [
+          "Revisit chops through the level without clear response",
+          "Liquidity disappears and the revisit loses structure"
+        ],
+        "offsetBps": 5
+      },
+      "stop": {
+        "name": "Unfinished Level Stop",
+        "sourceBook": "order_flow",
+        "stopType": "order_flow_level",
+        "placement": "Beyond the unfinished level with a small buffer beyond the auction extreme.",
+        "bufferBps": 6,
+        "catastrophicMultiplier": 1.25
+      },
+      "target": {
+        "name": "Auction Completion Targets",
+        "sourceBook": "order_flow",
+        "targetType": "auction_completion",
+        "target1": "Nearest HVN or POC",
+        "target2": "Auction completion objective",
+        "target3": "VWAP or next meaningful profile barrier",
+        "minRR": 1.25,
+        "partialPct1": 0.4,
+        "partialPct2": 0.35,
+        "partialPct3": 0.25
+      },
+      "management": {
+        "name": "UB Revisit Management",
+        "sourceBook": "order_flow",
+        "breakEvenAfter": "First meaningful reaction away from the unfinished level",
+        "trailAfter": "Only after the auction completion move is underway",
+        "earlyExitIf": [
+          "Revisit fails and price accepts through the unfinished level",
+          "Liquidity disappears before target one"
+        ],
+        "forceFlatIf": [
+          "Opposite unfinished-business magnet appears nearby"
+        ]
+      },
+      "risk": {
+        "name": "Fixed Fractional Book Risk",
+        "riskPerTradePct": 0.5,
+        "maxDailyLossPct": 2,
+        "maxOpenPositions": 3,
+        "maxTradesPerSymbolPerDay": 2,
+        "minRewardToRisk": 1.25,
+        "fundingHazardBlock": true
+      },
+      "requiredContext": [
+        "Recorded unfinished high or low",
+        "Nearby footprint structure"
+      ],
+      "requiredConfirmations": [
+        "Revisit reaction"
+      ],
+      "rejectIf": [
+        "No plan for stop behind the unfinished level",
+        "Reward-to-risk is below minimum"
+      ]
+    },
+    {
+      "name": "VWAP First Touch Combo",
+      "directionBias": "both",
+      "setup": "Price approaches VWAP from the correct side and the first touch lines up with a volume-profile level, order-flow confirmation, or price-action structure.",
+      "entry": {
+        "name": "VWAP First Touch Combo Entry",
+        "sourceBook": "vwap",
+        "entryType": "first_touch_combo",
+        "trigger": "Enter on the first VWAP touch only when confluence exists with profile or order-flow context.",
+        "confirmationRequired": [
+          "VWAP approach from correct side",
+          "Volume Profile or Order Flow confluence"
+        ],
+        "invalidIf": [
+          "No confluence at VWAP",
+          "VWAP is touched in chop without reaction"
+        ],
+        "offsetBps": 3
+      },
+      "stop": {
+        "name": "VWAP Combo Barrier Stop",
+        "sourceBook": "vwap",
+        "stopType": "combined_barrier",
+        "placement": "Beyond VWAP plus the recent swing or ATR-style structural buffer, choosing the farthest meaningful barrier.",
+        "bufferBps": 5,
+        "catastrophicMultiplier": 1.25
+      },
+      "target": {
+        "name": "VWAP Combo Targets",
+        "sourceBook": "vwap",
+        "targetType": "starter_plus_profile",
+        "target1": "1R starter target",
+        "target2": "Next VWAP deviation or profile barrier",
+        "target3": "Optional runner into broader structure",
+        "minRR": 1.25,
+        "partialPct1": 0.5,
+        "partialPct2": 0.3,
+        "partialPct3": 0.2
+      },
+      "management": {
+        "name": "VWAP First Touch Management",
+        "sourceBook": "vwap",
+        "breakEvenAfter": "Clear favorable reaction or TP1",
+        "trailAfter": "Only after TP1 if move proves itself",
+        "earlyExitIf": [
+          "VWAP fails to react",
+          "Confluence breaks immediately after touch"
+        ],
+        "forceFlatIf": [
+          "No confluence remains at the touch"
+        ]
+      },
+      "risk": {
+        "name": "Fixed Fractional Book Risk",
+        "riskPerTradePct": 0.5,
+        "maxDailyLossPct": 2,
+        "maxOpenPositions": 3,
+        "maxTradesPerSymbolPerDay": 2,
+        "minRewardToRisk": 1.25,
+        "fundingHazardBlock": true
+      },
+      "requiredContext": [
+        "VWAP approach from correct side",
+        "At least one profile or order-flow confluence"
+      ],
+      "requiredConfirmations": [
+        "Confluence confirmation at touch"
+      ],
+      "rejectIf": [
+        "First touch happens without confluence",
+        "Reward-to-risk is below minimum"
+      ]
+    },
+    {
+      "name": "VWAP Successful Reaction",
+      "directionBias": "both",
+      "setup": "Price touches VWAP and reacts away, creating a safer entry than a blind first touch.",
+      "entry": {
+        "name": "VWAP Reaction Candle Entry",
+        "sourceBook": "vwap",
+        "entryType": "reaction_confirmation",
+        "trigger": "Enter after the VWAP touch reacts and a confirmation candle closes in the reaction direction.",
+        "confirmationRequired": [
+          "VWAP touch",
+          "Reaction candle in intended direction"
+        ],
+        "invalidIf": [
+          "Price accepts through VWAP after touch"
+        ],
+        "offsetBps": 2
+      },
+      "stop": {
+        "name": "VWAP Reaction Stop",
+        "sourceBook": "vwap",
+        "stopType": "price_action_vwap",
+        "placement": "Beyond the reaction swing or just beyond VWAP if that is the level that should hold.",
+        "bufferBps": 4,
+        "catastrophicMultiplier": 1.2
+      },
+      "target": {
+        "name": "VWAP Reaction Targets",
+        "sourceBook": "vwap",
+        "targetType": "rr_then_structure",
+        "target1": "1R",
+        "target2": "VWAP first deviation",
+        "target3": "Next volume-profile barrier",
+        "minRR": 1.25,
+        "partialPct1": 0.5,
+        "partialPct2": 0.3,
+        "partialPct3": 0.2
+      },
+      "management": {
+        "name": "VWAP Reaction Management",
+        "sourceBook": "vwap",
+        "breakEvenAfter": "Clear favorable follow-through or TP1",
+        "trailAfter": "After TP1 only",
+        "earlyExitIf": [
+          "Price accepts back through VWAP",
+          "Reaction momentum disappears"
+        ],
+        "forceFlatIf": [
+          "VWAP loses relevance and price returns to chop"
+        ]
+      },
+      "risk": {
+        "name": "Fixed Fractional Book Risk",
+        "riskPerTradePct": 0.5,
+        "maxDailyLossPct": 2,
+        "maxOpenPositions": 3,
+        "maxTradesPerSymbolPerDay": 2,
+        "minRewardToRisk": 1.25,
+        "fundingHazardBlock": true
+      },
+      "requiredContext": [
+        "VWAP support or resistance reaction"
+      ],
+      "requiredConfirmations": [
+        "Price confirmation candle"
+      ],
+      "rejectIf": [
+        "Stop is unclear",
+        "Reward-to-risk is below minimum"
+      ]
+    },
+    {
+      "name": "VWAP Deviation Rotation",
+      "directionBias": "both",
+      "setup": "Price rotates between VWAP and the first deviation in a range, creating fade opportunities back toward fair value.",
+      "entry": {
+        "name": "Deviation Rotation Entry",
+        "sourceBook": "vwap",
+        "entryType": "deviation_rotation",
+        "trigger": "Fade the first deviation back toward VWAP after price reacts from the deviation instead of accepting beyond it.",
+        "confirmationRequired": [
+          "Range or rotational market",
+          "Reaction from first VWAP deviation"
+        ],
+        "invalidIf": [
+          "Price accepts beyond the deviation",
+          "Trend conditions replace rotational conditions"
+        ],
+        "offsetBps": 3
+      },
+      "stop": {
+        "name": "Deviation Extreme Stop",
+        "sourceBook": "vwap",
+        "stopType": "deviation_barrier",
+        "placement": "Beyond the deviation extreme that should not be accepted if rotation remains valid.",
+        "bufferBps": 5,
+        "catastrophicMultiplier": 1.2
+      },
+      "target": {
+        "name": "Deviation Rotation Targets",
+        "sourceBook": "vwap",
+        "targetType": "vwap_rotation",
+        "target1": "VWAP midpoint or line",
+        "target2": "Opposite first deviation",
+        "target3": "Optional full range extension if rotation persists",
+        "minRR": 1.25,
+        "partialPct1": 0.5,
+        "partialPct2": 0.35,
+        "partialPct3": 0.15
+      },
+      "management": {
+        "name": "Deviation Rotation Management",
+        "sourceBook": "vwap",
+        "breakEvenAfter": "Return toward VWAP",
+        "trailAfter": "Only after VWAP is reclaimed and move continues",
+        "earlyExitIf": [
+          "Price accepts beyond deviation"
+        ],
+        "forceFlatIf": [
+          "Rotational context is replaced by a strong trend"
+        ]
+      },
+      "risk": {
+        "name": "Fixed Fractional Book Risk",
+        "riskPerTradePct": 0.5,
+        "maxDailyLossPct": 2,
+        "maxOpenPositions": 3,
+        "maxTradesPerSymbolPerDay": 2,
+        "minRewardToRisk": 1.25,
+        "fundingHazardBlock": true
+      },
+      "requiredContext": [
+        "Rotational market between VWAP and first deviation"
+      ],
+      "requiredConfirmations": [
+        "Reaction from first deviation"
+      ],
+      "rejectIf": [
+        "Trend conditions dominate",
+        "Reward-to-risk is below minimum"
+      ]
+    },
+    {
+      "name": "VWAP Trend Deviation Continuation",
+      "directionBias": "both",
+      "setup": "Strong trend pulls back to the first VWAP deviation and uses that deviation as continuation support or resistance.",
+      "entry": {
+        "name": "Trend Deviation Continuation Entry",
+        "sourceBook": "vwap",
+        "entryType": "trend_deviation_continuation",
+        "trigger": "Enter after pullback to first deviation confirms continuation with supportive price action or aligned order-flow behavior.",
+        "confirmationRequired": [
+          "Strong trend context",
+          "Continuation confirmation from first deviation"
+        ],
+        "invalidIf": [
+          "Price accepts beyond the deviation",
+          "Momentum fades or delta diverges against the move"
+        ],
+        "offsetBps": 3
+      },
+      "stop": {
+        "name": "Trend Deviation Protective Stop",
+        "sourceBook": "vwap",
+        "stopType": "combined_barrier",
+        "placement": "Beyond the deviation and the pullback swing, using the strongest barrier among deviation, swing, profile level, and ATR-style fallback.",
+        "bufferBps": 6,
+        "catastrophicMultiplier": 1.25
+      },
+      "target": {
+        "name": "Trend Deviation Continuation Targets",
+        "sourceBook": "vwap",
+        "targetType": "rr_plus_extension",
+        "target1": "1R",
+        "target2": "Next deviation or extension target",
+        "target3": "Trailing trend target",
+        "minRR": 1.25,
+        "partialPct1": 0.4,
+        "partialPct2": 0.3,
+        "partialPct3": 0.3
+      },
+      "management": {
+        "name": "Trend Deviation Management",
+        "sourceBook": "vwap",
+        "breakEvenAfter": "TP1 or immediate favorable continuation",
+        "trailAfter": "TP2 or once the extension is underway",
+        "earlyExitIf": [
+          "Delta divergence appears",
+          "Momentum fades"
+        ],
+        "forceFlatIf": [
+          "Price accepts back through deviation and trend weakens"
+        ]
+      },
+      "risk": {
+        "name": "Fixed Fractional Book Risk",
+        "riskPerTradePct": 0.5,
+        "maxDailyLossPct": 2,
+        "maxOpenPositions": 3,
+        "maxTradesPerSymbolPerDay": 2,
+        "minRewardToRisk": 1.25,
+        "fundingHazardBlock": true
+      },
+      "requiredContext": [
+        "Strong trend",
+        "Pullback to first VWAP deviation"
+      ],
+      "requiredConfirmations": [
+        "Continuation confirmation"
+      ],
+      "rejectIf": [
+        "Stop is unclear",
+        "Reward-to-risk is below minimum"
+      ]
+    }
+  ],
+  "executionEnabled": false,
+  "paperTradingEnabled": false,
+  "status": "ready_for_paper_engine"
+}

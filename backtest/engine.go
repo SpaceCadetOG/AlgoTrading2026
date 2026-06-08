@@ -23,6 +23,9 @@ type Config struct {
 	CSVPath         string
 	EquityCSVPath   string
 	SignalCSVPath   string
+	StopLossPct     float64
+	TakeProfitPct   float64
+	SameBarPolicy   SameBarPolicy
 }
 
 type Engine struct {
@@ -64,6 +67,9 @@ func NewEngine(config Config, riskEngine *risk.Engine) *Engine {
 	}
 	if config.SignalCSVPath == "" {
 		config.SignalCSVPath = "research/signals.csv"
+	}
+	if config.SameBarPolicy == "" {
+		config.SameBarPolicy = SameBarStopFirst
 	}
 
 	return &Engine{
@@ -142,6 +148,10 @@ func signalPositionsByTime(signals series.SignalResult) map[int64]float64 {
 
 func (e *Engine) onCandleSignal(candle exchanges.Candle, signal float64, positionChange float64) {
 	e.markOpenPosition(candle)
+	if e.applyBracketExit(candle) {
+		e.appendPortfolioPoint(candle, signal, positionChange)
+		return
+	}
 
 	switch {
 	case positionChange > 0 && e.OpenPosition == nil:
@@ -152,6 +162,42 @@ func (e *Engine) onCandleSignal(candle exchanges.Candle, signal float64, positio
 
 	e.markOpenPosition(candle)
 	e.appendPortfolioPoint(candle, signal, positionChange)
+}
+
+func (e *Engine) applyBracketExit(candle exchanges.Candle) bool {
+	if e.OpenPosition == nil || (e.Config.StopLossPct <= 0 && e.Config.TakeProfitPct <= 0) {
+		return false
+	}
+	entry := e.OpenPosition.EntryPrice
+	side := Side(e.OpenPosition.Side)
+	stop := 0.0
+	target := 0.0
+	switch side {
+	case SideLong:
+		if e.Config.StopLossPct > 0 {
+			stop = entry * (1 - e.Config.StopLossPct)
+		}
+		if e.Config.TakeProfitPct > 0 {
+			target = entry * (1 + e.Config.TakeProfitPct)
+		}
+	case SideShort:
+		if e.Config.StopLossPct > 0 {
+			stop = entry * (1 + e.Config.StopLossPct)
+		}
+		if e.Config.TakeProfitPct > 0 {
+			target = entry * (1 - e.Config.TakeProfitPct)
+		}
+	default:
+		return false
+	}
+	exit := EvaluateBarExit(side, candle, stop, target, e.Config.SameBarPolicy)
+	if !exit.Hit {
+		return false
+	}
+	exitCandle := candle
+	exitCandle.Close = strconv.FormatFloat(exit.Price, 'f', -1, 64)
+	e.closeLong(exitCandle, "bracket_"+exit.Reason)
+	return true
 }
 
 func (e *Engine) openLong(candle exchanges.Candle) {

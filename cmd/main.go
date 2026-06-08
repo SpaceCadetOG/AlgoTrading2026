@@ -19,10 +19,13 @@ import (
 	"AlgoTrading2026/exchanges/lighter"
 	"AlgoTrading2026/features"
 	"AlgoTrading2026/indicators"
+	runtime "AlgoTrading2026/internal/runtime"
 	"AlgoTrading2026/l2recorder"
 	"AlgoTrading2026/labels"
 	"AlgoTrading2026/orderbook"
+	"AlgoTrading2026/orderflow"
 	"AlgoTrading2026/pairs"
+	"AlgoTrading2026/paper"
 	"AlgoTrading2026/realism"
 	"AlgoTrading2026/research"
 	"AlgoTrading2026/risk"
@@ -34,6 +37,7 @@ import (
 	chapter5 "AlgoTrading2026/strategies/chapter5"
 	"AlgoTrading2026/strategy"
 	"AlgoTrading2026/system"
+	"AlgoTrading2026/tradetape"
 	"AlgoTrading2026/volatility"
 	"AlgoTrading2026/volumeprofile"
 	"AlgoTrading2026/vwap"
@@ -191,6 +195,92 @@ type volumeProfileFinalBookStudy struct {
 	Packet research.VolumeProfileFinalBookPacket
 }
 
+type orderFlowFoundationStudy struct {
+	Rows    []research.OrderFlowFoundationRow
+	Summary research.OrderFlowFoundationSummary
+}
+
+type orderFlowDataCapabilityAuditStudy struct {
+	Report research.OrderFlowDataCapabilityAudit
+}
+
+type orderFlowRealFootprintsStudy struct {
+	Bars    []orderflow.FootprintBar
+	Rows    []research.OrderFlowRealFootprintRow
+	Summary research.OrderFlowRealFootprintSummary
+}
+
+type orderFlowVolumeClusterStudy struct {
+	Rows    []research.OrderFlowVolumeClusterSetupRow
+	Summary research.OrderFlowVolumeClusterSummary
+}
+
+type orderFlowVolumeClusterQualityStudy struct {
+	Rows    []research.OrderFlowVolumeClusterQualityRow
+	Summary research.OrderFlowVolumeClusterQualitySummary
+}
+
+type orderFlowMultipleHVNStudy struct {
+	Rows    []research.OrderFlowMultipleHVNSetupRow
+	Summary research.OrderFlowMultipleHVNSummary
+}
+
+type orderFlowBackfilledFootprintsStudy struct {
+	Bars    []orderflow.FootprintBar
+	Rows    []research.OrderFlowRealFootprintRow
+	Summary research.OrderFlowBackfilledFootprintSummary
+}
+
+type orderFlowBackfilledSetupReplayStudy struct {
+	Replay     research.OrderFlowBackfilledSetupReplay
+	Comparison research.OrderFlowLiveVsBackfillComparison
+}
+
+type orderFlowTradesFilterStudy struct {
+	Rows    []research.OrderFlowTradesFilterSetupRow
+	Summary research.OrderFlowTradesFilterSummary
+}
+
+type orderFlowStackedImbalanceStudy struct {
+	Rows    []research.OrderFlowStackedImbalanceSetupRow
+	Summary research.OrderFlowStackedImbalanceSummary
+}
+
+type orderFlowUnfinishedBusinessStudy struct {
+	Rows    []research.OrderFlowUnfinishedBusinessSetupRow
+	Summary research.OrderFlowUnfinishedBusinessSummary
+}
+
+type orderFlowBigLimitOrderStudy struct {
+	Rows    []research.OrderFlowBigLimitOrderRow
+	Summary research.OrderFlowBigLimitOrderSummary
+}
+
+type orderFlowAbsorptionStudy struct {
+	Rows    []research.OrderFlowAbsorptionRow
+	Summary research.OrderFlowAbsorptionSummary
+}
+
+type orderFlowAggressiveDeltaStudy struct {
+	Rows    []research.OrderFlowAggressiveDeltaRow
+	Summary research.OrderFlowAggressiveDeltaSummary
+}
+
+type orderFlowCumulativeDeltaDivergenceStudy struct {
+	Rows    []research.OrderFlowCumulativeDeltaDivergenceRow
+	Summary research.OrderFlowCumulativeDeltaDivergenceSummary
+}
+
+type orderFlowConfirmationComparisonStudy struct {
+	Rows    []research.OrderFlowConfirmationComparisonRow
+	Summary research.OrderFlowConfirmationComparisonSummary
+}
+
+type bookTradeRulesStudy struct {
+	Packet        strategy.BookTradeRulesPacket
+	ArchivedCount int
+}
+
 func asterEnv(name string) string {
 	if config.IsTestnet() {
 		return os.Getenv("ASTER_TESTNET_" + name)
@@ -224,12 +314,278 @@ func main() {
 	_ = godotenv.Load()
 	log.Println("TRADING_ENV:", config.TradingEnv())
 
+	backfillConfig := tradetape.DefaultBackfillConfig()
+	if backfillConfig.RunAsterAggTradesBackfill {
+		runAsterAggTradesBackfill(backfillConfig)
+		return
+	}
+
+	tradeTapeConfig := tradetape.DefaultRecorderConfig()
+	if tradeTapeConfig.RunTradeTapeRecorder {
+		runTradeTapeRecorder(tradeTapeConfig)
+		return
+	}
+
 	if strings.EqualFold(os.Getenv("RUN_L2_RECORDER"), "true") {
 		runL2Recorder()
 		return
 	}
 
-	runResearchHarness()
+	if strings.EqualFold(config.TradingMode(), "paper") {
+		runPaperRuntime()
+		return
+	}
+	if strings.EqualFold(config.TradingMode(), "live") {
+		runLiveRuntime()
+		return
+	}
+
+	if shouldRunFullResearchHarness() {
+		runResearchHarness()
+		return
+	}
+
+	runBookTradeRules()
+}
+
+func runLiveRuntime() {
+	cfg := paper.DefaultConfig()
+	cfg.Mode = "live"
+	engine, err := paper.NewEngine(cfg)
+	if err != nil {
+		log.Fatalf("init live runtime: %v", err)
+	}
+
+	universe, err := engine.SelectUniverse(cfg)
+	if err != nil {
+		log.Fatalf("select live universe: %v", err)
+	}
+	client := aster.NewClient(asterEnv("USER"), asterEnv("SIGNER"), asterEnv("PRIVATE_KEY"))
+	executor := runtime.LiveExecutor{
+		Placer: client,
+		Gate:   runtime.LiveGateFromEnv(),
+	}
+
+	decisions := 0
+	approved := 0
+	refused := 0
+	placed := 0
+	for _, entry := range universe.Selected {
+		snapshot, err := engine.FetchOrderBook(entry.Venue, entry.Symbol)
+		if err != nil {
+			log.Printf("live snapshot failed venue=%s symbol=%s: %v", entry.Venue, entry.Symbol, err)
+			continue
+		}
+		candidates := engine.BuildCandidates.BuildCandidates(runtime.ContextFromOrderBook(snapshot))
+		for _, candidate := range candidates {
+			decisions++
+			riskDecision := paper.CheckRisk(engine.State, candidate, cfg, time.Now().UTC().UnixMilli())
+			if !riskDecision.Allowed {
+				continue
+			}
+			approved++
+			result, err := executor.Execute(runtime.ExecutionDecision{
+				Candidate: candidate,
+				Risk:      runtime.RiskDecision{Allowed: riskDecision.Allowed, Reasons: riskDecision.Reasons},
+				Mode:      "live",
+			})
+			if err != nil {
+				log.Fatalf("execute live order: %v", err)
+			}
+			if result.Accepted {
+				placed++
+				fmt.Printf("live_order_accepted venue=%s symbol=%s orderID=%s status=%s\n", result.Venue, result.Symbol, result.OrderID, result.Status)
+			} else {
+				refused++
+				fmt.Printf("live_order_refused venue=%s symbol=%s reason=%s\n", candidate.Venue, candidate.Symbol, result.Message)
+			}
+			break
+		}
+		if placed > 0 {
+			break
+		}
+	}
+
+	fmt.Println("=== LIVE RUNTIME ===")
+	fmt.Printf("mode=%s\n", cfg.Mode)
+	fmt.Printf("gateLiveEnabled=%t\n", executor.Gate.EnableLiveTrading)
+	fmt.Printf("gateVenueHealthy=%t\n", executor.Gate.VenueHealthy)
+	fmt.Printf("gateAccountReady=%t\n", executor.Gate.AccountReady)
+	fmt.Printf("selectedSymbols=%d\n", len(universe.Selected))
+	fmt.Printf("decisions=%d\n", decisions)
+	fmt.Printf("approved=%d\n", approved)
+	fmt.Printf("refused=%d\n", refused)
+	fmt.Printf("placed=%d\n", placed)
+}
+
+func shouldRunFullResearchHarness() bool {
+	return strings.EqualFold(os.Getenv("RUN_FULL_RESEARCH_HARNESS"), "true")
+}
+
+func runAsterAggTradesBackfill(cfg tradetape.BackfillConfig) {
+	provider := aster.AggTradeProvider{}
+	rows, dedupedRows, dedupe, err := tradetape.RunBackfill(provider, cfg)
+	errors := 0
+	if err != nil {
+		errors = 1
+	}
+	summary := research.BuildTradeTapeBackfillSummary(
+		provider.Venue(),
+		cfg.Symbol,
+		cfg.StartMS,
+		cfg.EndMS,
+		len(aster.BackfillAsterAggTradeWindows(cfg.StartMS, cfg.EndMS)),
+		len(rows),
+		dedupe,
+		errors,
+	)
+	if err := research.WriteTradeTapeBackfillSummaryJSON("research/trade_tape_backfill_summary.json", summary); err != nil {
+		log.Fatalf("write trade tape backfill summary json: %v", err)
+	}
+	if err := research.WriteTradeTapeBackfillSummaryMarkdown("research/trade_tape_backfill_summary.md", summary); err != nil {
+		log.Fatalf("write trade tape backfill summary markdown: %v", err)
+	}
+	if err != nil {
+		log.Fatalf("run aster aggTrades backfill: %v", err)
+	}
+	fmt.Println("=== ASTER AGGTRADES BACKFILL ===")
+	fmt.Printf("symbol=%s\n", cfg.Symbol)
+	fmt.Printf("start=%d\n", cfg.StartMS)
+	fmt.Printf("end=%d\n", cfg.EndMS)
+	fmt.Printf("windows=%d\n", summary.Windows)
+	fmt.Printf("rows=%d\n", len(rows))
+	fmt.Printf("dedupedRows=%d\n", len(dedupedRows))
+	fmt.Printf("duplicates=%d\n", dedupe.DuplicateRows)
+	fmt.Printf("invalidRows=%d\n", dedupe.InvalidRows)
+	fmt.Printf("output=%s\n", cfg.OutputPath)
+	fmt.Printf("deduped=%s\n", cfg.DedupedOutputPath)
+	fmt.Println("wrote research/trade_tape_backfill_summary.json")
+	fmt.Println("wrote research/trade_tape_backfill_summary.md")
+}
+
+func runTradeTapeRecorder(cfg tradetape.RecorderConfig) {
+	recorder := tradetape.NewRecorder(cfg, buildTradeTapeFetchers())
+	fmt.Println("=== TRADE TAPE RECORDER ===")
+	fmt.Printf("venues=%d\n", len(recorder.Fetchers))
+	fmt.Printf("intervalSeconds=%d\n", cfg.IntervalSeconds)
+	fmt.Printf("maxRounds=%d\n", cfg.MaxRounds)
+	fmt.Printf("output=%s\n", cfg.OutputPath)
+	fmt.Println()
+
+	summary, err := recorder.Run()
+	if err != nil {
+		log.Fatalf("run trade tape recorder: %v", err)
+	}
+	fmt.Printf("rounds=%d\n", summary.Rounds)
+	fmt.Printf("rows=%d\n", summary.Rows)
+	fmt.Printf("errors=%d\n", summary.Errors)
+	fmt.Printf("wrote %s\n", cfg.OutputPath)
+}
+
+func runBookTradeRules() {
+	study := buildBookTradeRules()
+	playbooks, entryRules, stopRules, targetRules, managementRules := strategyRuleCounts(study.Packet.Playbooks)
+
+	fmt.Println("=== BOOK TRADE RULES ===")
+	fmt.Printf("playbooks=%d\n", len(study.Packet.Playbooks))
+	fmt.Printf("entryRules=%d\n", entryRules)
+	fmt.Printf("stopRules=%d\n", stopRules)
+	fmt.Printf("targetRules=%d\n", targetRules)
+	fmt.Printf("managementRules=%d\n", managementRules)
+	fmt.Printf("riskRules=%d\n", playbooks)
+	fmt.Printf("executionEnabled=%t\n", study.Packet.ExecutionEnabled)
+	fmt.Printf("paperTradingEnabled=%t\n", study.Packet.PaperTradingEnabled)
+	fmt.Printf("status=%s\n", study.Packet.Status)
+	fmt.Printf("archivedResearchArtifacts=%d\n", study.ArchivedCount)
+	fmt.Println("wrote docs/book_trade_rules.md")
+	fmt.Println("wrote strategy/book_trade_rules_packet.json")
+	fmt.Println("wrote strategy/book_trade_rules_packet.md")
+}
+
+func runPaperRuntime() {
+	cfg := paper.DefaultConfig()
+	engine, err := paper.NewEngine(cfg)
+	if err != nil {
+		log.Fatalf("init paper engine: %v", err)
+	}
+	summary, err := engine.Run()
+	if err != nil {
+		log.Fatalf("run paper engine: %v", err)
+	}
+	status := engine.StatusPayload()
+	recorders := "disabled"
+	if cfg.EnableRecorders {
+		recorders = "enabled"
+	}
+
+	fmt.Println("=== PAPER RUNTIME ===")
+	fmt.Printf("mode=%s\n", cfg.Mode)
+	fmt.Printf("liveEnabled=%t\n", engine.State.LiveEnabled)
+	fmt.Printf("paperEnabled=%t\n", engine.State.PaperEnabled)
+	fmt.Printf("balance=%.2f\n", status.Paper.Balance)
+	fmt.Printf("equity=%.2f\n", status.Paper.Equity)
+	fmt.Printf("universeMode=%s\n", summary.UniverseMode)
+	fmt.Printf("min24hVolumeUsd=%.0f\n", summary.Min24hVolumeUSD)
+	fmt.Printf("selectedSymbols=%d\n", summary.SelectedSymbols)
+	fmt.Printf("venues=%d\n", summary.Venues)
+	fmt.Printf("decisions=%d\n", summary.Decisions)
+	fmt.Printf("approved=%d\n", summary.Approved)
+	fmt.Printf("rejected=%d\n", summary.Rejected)
+	fmt.Printf("openPositions=%d\n", status.Paper.OpenCount)
+	fmt.Printf("recentClosed=%d\n", status.Paper.RecentClosedCount)
+	fmt.Printf("recorders=%s\n", recorders)
+	fmt.Printf("status=%s\n", "running")
+}
+
+func buildBookTradeRules() bookTradeRulesStudy {
+	archivedCount, err := research.ArchiveGeneratedResearchOutputs("research")
+	if err != nil {
+		log.Fatalf("archive generated research outputs: %v", err)
+	}
+
+	packet := strategy.DefaultBookTradeRulesPacket()
+	if err := strategy.WriteBookTradeRulesMarkdown("docs/book_trade_rules.md", packet.Playbooks); err != nil {
+		log.Fatalf("write book trade rules docs: %v", err)
+	}
+	if err := strategy.WriteBookTradeRulesPacketJSON("strategy/book_trade_rules_packet.json", packet); err != nil {
+		log.Fatalf("write book trade rules packet json: %v", err)
+	}
+	if err := strategy.WriteBookTradeRulesPacketMarkdown("strategy/book_trade_rules_packet.md", packet); err != nil {
+		log.Fatalf("write book trade rules packet markdown: %v", err)
+	}
+
+	return bookTradeRulesStudy{
+		Packet:        packet,
+		ArchivedCount: archivedCount,
+	}
+}
+
+func strategyRuleCounts(playbooks []strategy.ExecutablePlaybook) (int, int, int, int, int) {
+	playbookCount := len(playbooks)
+	return playbookCount, playbookCount, playbookCount, playbookCount, playbookCount
+}
+
+func buildTradeTapeFetchers() []tradetape.VenueFetcher {
+	return []tradetape.VenueFetcher{
+		{
+			Venue: "hyperliquid", Symbol: "BTC",
+			Fetch: func() ([]tradetape.TradeTapePrint, error) {
+				return hyperliquid.GetRecentTrades("BTC")
+			},
+		},
+		{
+			Venue: "aster", Symbol: "BTCUSDT",
+			Fetch: func() ([]tradetape.TradeTapePrint, error) {
+				return aster.GetRecentTrades("BTCUSDT", 100)
+			},
+		},
+		{
+			Venue: "lighter", Symbol: "BTC",
+			Fetch: func() ([]tradetape.TradeTapePrint, error) {
+				return lighter.GetRecentTrades("BTC")
+			},
+		},
+	}
 }
 
 func runResearchHarness() {
@@ -271,6 +627,85 @@ func runResearchHarness() {
 	orderBookRows := buildOrderBookResearchRows(orderBookSnapshots, candlesByVenue(venues))
 	instrumentUniverse := buildInstrumentUniverseStudy(orderBookRows.Features, venues)
 	volumeProfileFinalBook := buildVolumeProfileFinalBookPacket()
+	orderFlowFoundation := buildOrderFlowFoundationStudy()
+	orderFlowDataCapabilityAudit := buildOrderFlowDataCapabilityAuditStudy()
+	tradeTapeAnalysis, tradeTapeAnalysisOK := buildTradeTapeAnalysis()
+	orderFlowRealFootprints, orderFlowRealFootprintsOK := buildOrderFlowRealFootprints()
+	orderFlowVolumeClusters, orderFlowVolumeClustersOK := buildOrderFlowVolumeClusters(orderFlowRealFootprints.Rows, orderFlowRealFootprintsOK)
+	orderFlowVolumeClusterQuality, orderFlowVolumeClusterQualityOK := buildOrderFlowVolumeClusterQuality(orderFlowVolumeClustersOK)
+	orderFlowMultipleHVNs, orderFlowMultipleHVNsOK := buildOrderFlowMultipleHVNs(orderFlowRealFootprints.Rows, orderFlowRealFootprintsOK)
+	orderFlowBackfilledFootprints, orderFlowBackfilledFootprintsOK := buildOrderFlowBackfilledFootprints()
+	orderFlowBackfilledReplay, orderFlowBackfilledReplayOK := buildOrderFlowBackfilledSetupReplay(
+		orderFlowBackfilledFootprints.Rows,
+		orderFlowBackfilledFootprints.Summary,
+		orderFlowBackfilledFootprintsOK,
+		tradeTapeAnalysis.Rows,
+		orderFlowRealFootprints.Summary,
+		orderFlowVolumeClusters.Summary,
+		orderFlowMultipleHVNs.Summary,
+	)
+	orderFlowTradesFilter, orderFlowTradesFilterOK := buildOrderFlowTradesFilter(
+		orderFlowBackfilledFootprints.Rows,
+		orderFlowBackfilledReplay.Replay.MultipleHVNRows,
+		orderFlowBackfilledFootprintsOK && orderFlowBackfilledReplayOK,
+		orderFlowBackfilledReplay.Replay.VolumeClusterSummary,
+		orderFlowBackfilledReplay.Replay.MultipleHVNSummary,
+	)
+	orderFlowStackedImbalances, orderFlowStackedImbalancesOK := buildOrderFlowStackedImbalances(
+		orderFlowBackfilledFootprints.Bars,
+		orderFlowBackfilledFootprints.Rows,
+		orderFlowBackfilledReplay.Replay.MultipleHVNRows,
+		orderFlowBackfilledFootprintsOK && orderFlowBackfilledReplayOK && orderFlowTradesFilterOK,
+		orderFlowBackfilledReplay.Replay.VolumeClusterSummary,
+		orderFlowBackfilledReplay.Replay.MultipleHVNSummary,
+		orderFlowTradesFilter.Summary,
+	)
+	orderFlowUnfinishedBusiness, orderFlowUnfinishedBusinessOK := buildOrderFlowUnfinishedBusiness(
+		orderFlowBackfilledFootprints.Bars,
+		orderFlowBackfilledFootprints.Rows,
+		orderFlowStackedImbalancesOK,
+		orderFlowBackfilledReplay.Replay.VolumeClusterSummary,
+		orderFlowBackfilledReplay.Replay.MultipleHVNSummary,
+		orderFlowTradesFilter.Summary,
+		orderFlowStackedImbalances.Summary,
+	)
+	orderFlowBigLimitOrders, orderFlowBigLimitOrdersOK := buildOrderFlowBigLimitOrders(
+		orderFlowRealFootprints.Rows,
+		orderFlowBackfilledFootprints.Rows,
+		orderFlowTradesFilter.Rows,
+		orderFlowRealFootprintsOK || orderFlowUnfinishedBusinessOK,
+		orderFlowTradesFilter.Summary,
+		orderFlowStackedImbalances.Summary,
+		orderFlowUnfinishedBusiness.Summary,
+	)
+	orderFlowAbsorption, orderFlowAbsorptionOK := buildOrderFlowAbsorption(
+		orderFlowRealFootprints.Rows,
+		orderFlowBackfilledFootprints.Rows,
+		orderFlowTradesFilter.Rows,
+		orderFlowRealFootprintsOK || orderFlowBackfilledFootprintsOK,
+		orderFlowBigLimitOrders.Summary,
+		orderFlowTradesFilter.Summary,
+		orderFlowStackedImbalances.Summary,
+	)
+	orderFlowAggressiveDelta, orderFlowAggressiveDeltaOK := buildOrderFlowAggressiveDelta(
+		orderFlowRealFootprints.Rows,
+		orderFlowBackfilledFootprints.Rows,
+		orderFlowTradesFilter.Rows,
+		orderFlowRealFootprintsOK || orderFlowBackfilledFootprintsOK,
+	)
+	orderFlowCumulativeDeltaDivergence, orderFlowCumulativeDeltaDivergenceOK := buildOrderFlowCumulativeDeltaDivergence(
+		orderFlowRealFootprints.Rows,
+		orderFlowBackfilledFootprints.Rows,
+		orderFlowTradesFilter.Rows,
+		orderFlowRealFootprintsOK || orderFlowBackfilledFootprintsOK,
+	)
+	orderFlowConfirmationComparison, orderFlowConfirmationComparisonOK := buildOrderFlowConfirmationComparison(
+		orderFlowBigLimitOrders.Summary,
+		orderFlowAbsorption.Summary,
+		orderFlowAggressiveDelta.Summary,
+		orderFlowCumulativeDeltaDivergence.Summary,
+		orderFlowBigLimitOrdersOK && orderFlowAbsorptionOK && orderFlowAggressiveDeltaOK && orderFlowCumulativeDeltaDivergenceOK,
+	)
 	vwapL2Refresh := buildVWAPL2RefreshStudy(venues, orderBookRows.Snapshots)
 	l2SnapshotAnalysis, l2SnapshotAnalysisOK := buildL2SnapshotAnalysis()
 	chapter2Results := runChapter2(primary, frame)
@@ -644,6 +1079,281 @@ func runResearchHarness() {
 	fmt.Printf("archivedAudits=%d\n", volumeProfileFinalBook.Packet.ArchivedAudits)
 	fmt.Println("packet=research/volume_profile_final_book_packet.md")
 	fmt.Println()
+	fmt.Println("=== ORDER FLOW PHASE 1 FOUNDATION ===")
+	fmt.Printf("bars=%d\n", orderFlowFoundation.Summary.Bars)
+	fmt.Printf("validBars=%d\n", orderFlowFoundation.Summary.ValidBars)
+	fmt.Printf("totalDelta=%.2f\n", orderFlowFoundation.Summary.TotalDelta)
+	fmt.Printf("finalCumulativeDelta=%.2f\n", orderFlowFoundation.Summary.FinalCumulativeDelta)
+	fmt.Printf("volumeClusters=%d\n", orderFlowFoundation.Summary.VolumeClusters)
+	fmt.Printf("imbalances=%d\n", orderFlowFoundation.Summary.Imbalances)
+	fmt.Printf("stackedImbalances=%d\n", orderFlowFoundation.Summary.StackedImbalances)
+	fmt.Printf("unfinishedBusinessHigh=%d\n", orderFlowFoundation.Summary.UnfinishedBusinessHigh)
+	fmt.Printf("unfinishedBusinessLow=%d\n", orderFlowFoundation.Summary.UnfinishedBusinessLow)
+	fmt.Printf("largeTrades=%d\n", orderFlowFoundation.Summary.LargeTrades)
+	fmt.Println("wrote research/orderflow_foundation.csv")
+	fmt.Println("wrote research/orderflow_foundation_summary.json")
+	fmt.Println()
+	fmt.Println("=== ORDER FLOW DATA CAPABILITY AUDIT ===")
+	fmt.Printf("venues=%d\n", len(orderFlowDataCapabilityAudit.Report.Venues))
+	fmt.Printf("footprintReady=%d\n", research.OrderFlowFootprintReadyCount(orderFlowDataCapabilityAudit.Report))
+	fmt.Printf("tradeTapeReady=%d\n", research.OrderFlowTradeTapeReadyCount(orderFlowDataCapabilityAudit.Report))
+	fmt.Printf("recommendedNextPhase=%s\n", orderFlowDataCapabilityAudit.Report.NextPhase)
+	fmt.Printf("lighterTradeTapeStatus=%s\n", research.LighterTradeTapeStatus(orderFlowDataCapabilityAudit.Report))
+	fmt.Println("wrote research/orderflow_data_capability_audit.md")
+	fmt.Println("wrote research/orderflow_data_capability_audit.json")
+	fmt.Println("wrote research/lighter_trade_tape_adapter_plan.md")
+	fmt.Println()
+	if tradeTapeAnalysisOK {
+		fmt.Println("=== TRADE TAPE ANALYSIS ===")
+		fmt.Printf("rows=%d\n", tradeTapeAnalysis.Rows)
+		fmt.Printf("validRows=%d\n", tradeTapeAnalysis.ValidRows)
+		fmt.Printf("venues=%d\n", tradeTapeAnalysis.Venues)
+		fmt.Printf("venueSymbols=%d\n", tradeTapeAnalysis.VenueSymbols)
+		fmt.Printf("canonicalSymbols=%d\n", tradeTapeAnalysis.CanonicalSymbols)
+		fmt.Printf("totalVolume=%.8f\n", tradeTapeAnalysis.TotalVolume)
+		fmt.Printf("largestTrade=%.8f\n", tradeTapeAnalysis.LargestTrade)
+		fmt.Println("wrote research/trade_tape_analysis.json")
+		fmt.Println("wrote research/trade_tape_analysis.md")
+		fmt.Println()
+	}
+	if orderFlowRealFootprintsOK {
+		fmt.Println("=== ORDER FLOW PHASE 2B REAL FOOTPRINTS ===")
+		fmt.Printf("bars=%d\n", orderFlowRealFootprints.Summary.Bars)
+		fmt.Printf("venues=%d\n", orderFlowRealFootprints.Summary.Venues)
+		fmt.Printf("venueSymbols=%d\n", orderFlowRealFootprints.Summary.VenueSymbols)
+		fmt.Printf("canonicalSymbols=%d\n", orderFlowRealFootprints.Summary.CanonicalSymbols)
+		fmt.Printf("volumeClusters=%d\n", orderFlowRealFootprints.Summary.VolumeClusters)
+		fmt.Printf("imbalances=%d\n", orderFlowRealFootprints.Summary.Imbalances)
+		fmt.Printf("stackedImbalances=%d\n", orderFlowRealFootprints.Summary.StackedImbalances)
+		fmt.Printf("unfinishedBusinessHigh=%d\n", orderFlowRealFootprints.Summary.UnfinishedBusinessHigh)
+		fmt.Printf("unfinishedBusinessLow=%d\n", orderFlowRealFootprints.Summary.UnfinishedBusinessLow)
+		fmt.Println("wrote research/orderflow_real_footprints.csv")
+		fmt.Println("wrote research/orderflow_real_footprints_summary.json")
+		fmt.Println("wrote research/orderflow_real_footprints.md")
+		fmt.Println()
+	}
+	if orderFlowVolumeClustersOK {
+		fmt.Println("=== ORDER FLOW SETUP #1 VOLUME CLUSTERS ===")
+		fmt.Printf("setups=%d\n", orderFlowVolumeClusters.Summary.Setups)
+		fmt.Printf("longContexts=%d\n", orderFlowVolumeClusters.Summary.LongContexts)
+		fmt.Printf("shortContexts=%d\n", orderFlowVolumeClusters.Summary.ShortContexts)
+		fmt.Printf("accepted=%d\n", orderFlowVolumeClusters.Summary.Accepted)
+		fmt.Printf("rejected=%d\n", orderFlowVolumeClusters.Summary.Rejected)
+		fmt.Printf("retests=%d\n", orderFlowVolumeClusters.Summary.Retests)
+		fmt.Printf("bestDirection=%s\n", orderFlowVolumeClusters.Summary.BestDirection)
+		fmt.Printf("bestDirectionFT20=%.8f\n", orderFlowVolumeClusters.Summary.BestDirectionFT20)
+		fmt.Println("wrote research/orderflow_setup_volume_cluster.csv")
+		fmt.Println("wrote research/orderflow_setup_volume_cluster_summary.json")
+		fmt.Println("wrote research/orderflow_setup_volume_cluster.md")
+		fmt.Println()
+	}
+	if orderFlowVolumeClusterQualityOK {
+		fmt.Println("=== ORDER FLOW VOLUME CLUSTER QUALITY ===")
+		fmt.Printf("bestDirection=%s\n", orderFlowVolumeClusterQuality.Summary.BestDirection)
+		fmt.Printf("bestVenue=%s\n", orderFlowVolumeClusterQuality.Summary.BestVenue)
+		fmt.Printf("bestRetestGroup=%s\n", orderFlowVolumeClusterQuality.Summary.BestRetestGroup)
+		fmt.Printf("acceptedClusterVolume=%.8f\n", orderFlowVolumeClusterQuality.Summary.AcceptedClusterVolume)
+		fmt.Printf("acceptedDelta=%.8f\n", orderFlowVolumeClusterQuality.Summary.AcceptedDelta)
+		fmt.Println("wrote research/orderflow_volume_cluster_quality.csv")
+		fmt.Println("wrote research/orderflow_volume_cluster_quality.json")
+		fmt.Println("wrote research/orderflow_volume_cluster_quality.md")
+		fmt.Println()
+	}
+	if orderFlowMultipleHVNsOK {
+		fmt.Println("=== ORDER FLOW SETUP #2 MULTIPLE HVNS ===")
+		fmt.Printf("setups=%d\n", orderFlowMultipleHVNs.Summary.Setups)
+		fmt.Printf("longContexts=%d\n", orderFlowMultipleHVNs.Summary.LongContexts)
+		fmt.Printf("shortContexts=%d\n", orderFlowMultipleHVNs.Summary.ShortContexts)
+		fmt.Printf("accepted=%d\n", orderFlowMultipleHVNs.Summary.Accepted)
+		fmt.Printf("rejected=%d\n", orderFlowMultipleHVNs.Summary.Rejected)
+		fmt.Printf("retests=%d\n", orderFlowMultipleHVNs.Summary.Retests)
+		fmt.Printf("averageHVNCount=%.2f\n", orderFlowMultipleHVNs.Summary.AverageHVNCount)
+		fmt.Printf("bestDirection=%s\n", orderFlowMultipleHVNs.Summary.BestDirection)
+		fmt.Printf("bestDirectionFT20=%.8f\n", orderFlowMultipleHVNs.Summary.BestDirectionFT20)
+		fmt.Println("wrote research/orderflow_setup_multiple_hvn.csv")
+		fmt.Println("wrote research/orderflow_setup_multiple_hvn_summary.json")
+		fmt.Println("wrote research/orderflow_setup_multiple_hvn.md")
+		fmt.Println()
+	}
+	if orderFlowBackfilledFootprintsOK {
+		fmt.Println("=== ORDER FLOW PHASE 2D BACKFILLED FOOTPRINTS ===")
+		fmt.Printf("source=%s\n", orderFlowBackfilledFootprints.Summary.Source)
+		fmt.Printf("tradeRows=%d\n", orderFlowBackfilledFootprints.Summary.TradeRows)
+		fmt.Printf("footprintBars=%d\n", orderFlowBackfilledFootprints.Summary.FootprintBars)
+		fmt.Printf("volumeClusters=%d\n", orderFlowBackfilledFootprints.Summary.VolumeClusters)
+		fmt.Printf("imbalances=%d\n", orderFlowBackfilledFootprints.Summary.Imbalances)
+		fmt.Printf("stackedImbalances=%d\n", orderFlowBackfilledFootprints.Summary.StackedImbalances)
+		fmt.Println("wrote research/orderflow_backfilled_footprints.csv")
+		fmt.Println("wrote research/orderflow_backfilled_footprints_summary.json")
+		fmt.Println("wrote research/orderflow_backfilled_footprints.md")
+		fmt.Println()
+	}
+	if orderFlowBackfilledReplayOK {
+		fmt.Println("=== ORDER FLOW BACKFILLED SETUP REPLAY ===")
+		fmt.Printf("volumeClusterSetups=%d\n", orderFlowBackfilledReplay.Replay.VolumeClusterSummary.Setups)
+		fmt.Printf("multipleHVNSetups=%d\n", orderFlowBackfilledReplay.Replay.MultipleHVNSummary.Setups)
+		fmt.Printf("volumeClusterAccepted=%d\n", orderFlowBackfilledReplay.Replay.VolumeClusterSummary.Accepted)
+		fmt.Printf("multipleHVNAccepted=%d\n", orderFlowBackfilledReplay.Replay.MultipleHVNSummary.Accepted)
+		fmt.Println("wrote backfilled setup reports")
+		fmt.Println()
+		fmt.Println("=== ORDER FLOW LIVE VS BACKFILL COMPARISON ===")
+		fmt.Printf("liveFootprintBars=%d\n", orderFlowBackfilledReplay.Comparison.LiveFootprintBars)
+		fmt.Printf("backfilledFootprintBars=%d\n", orderFlowBackfilledReplay.Comparison.BackfilledFootprintBars)
+		fmt.Printf("liveVolumeClusterSetups=%d\n", orderFlowBackfilledReplay.Comparison.LiveVolumeClusterSetups)
+		fmt.Printf("backfilledVolumeClusterSetups=%d\n", orderFlowBackfilledReplay.Comparison.BackfilledVolumeClusterSetups)
+		fmt.Printf("liveMultipleHVNSetups=%d\n", orderFlowBackfilledReplay.Comparison.LiveMultipleHVNSetups)
+		fmt.Printf("backfilledMultipleHVNSetups=%d\n", orderFlowBackfilledReplay.Comparison.BackfilledMultipleHVNSetups)
+		fmt.Println("wrote research/orderflow_live_vs_backfill_comparison.md")
+		fmt.Println()
+	}
+	if orderFlowTradesFilterOK {
+		fmt.Println("=== ORDER FLOW SETUP #3 TRADES FILTER ===")
+		fmt.Printf("setups=%d\n", orderFlowTradesFilter.Summary.Setups)
+		fmt.Printf("largeBuyTrades=%d\n", orderFlowTradesFilter.Summary.LargeBuyTrades)
+		fmt.Printf("largeSellTrades=%d\n", orderFlowTradesFilter.Summary.LargeSellTrades)
+		fmt.Printf("accepted=%d\n", orderFlowTradesFilter.Summary.Accepted)
+		fmt.Printf("rejected=%d\n", orderFlowTradesFilter.Summary.Rejected)
+		fmt.Printf("nearHVN=%d\n", orderFlowTradesFilter.Summary.NearHVN)
+		fmt.Printf("nearVolumeCluster=%d\n", orderFlowTradesFilter.Summary.NearVolumeCluster)
+		fmt.Printf("nearMultipleHVN=%d\n", orderFlowTradesFilter.Summary.NearMultipleHVN)
+		fmt.Printf("bestDirection=%s\n", orderFlowTradesFilter.Summary.BestDirection)
+		fmt.Printf("bestDirectionFT20=%.8f\n", orderFlowTradesFilter.Summary.BestDirectionFT20)
+		fmt.Println("wrote research/orderflow_setup_trades_filter.csv")
+		fmt.Println("wrote research/orderflow_setup_trades_filter_summary.json")
+		fmt.Println("wrote research/orderflow_setup_trades_filter.md")
+		fmt.Println()
+	}
+	if orderFlowStackedImbalancesOK {
+		fmt.Println("=== ORDER FLOW SETUP #4 STACKED IMBALANCES ===")
+		fmt.Printf("setups=%d\n", orderFlowStackedImbalances.Summary.Setups)
+		fmt.Printf("buyStackedImbalances=%d\n", orderFlowStackedImbalances.Summary.BuyStackedImbalances)
+		fmt.Printf("sellStackedImbalances=%d\n", orderFlowStackedImbalances.Summary.SellStackedImbalances)
+		fmt.Printf("accepted=%d\n", orderFlowStackedImbalances.Summary.Accepted)
+		fmt.Printf("rejected=%d\n", orderFlowStackedImbalances.Summary.Rejected)
+		fmt.Printf("neutral=%d\n", orderFlowStackedImbalances.Summary.Neutral)
+		fmt.Printf("retests=%d\n", orderFlowStackedImbalances.Summary.Retests)
+		fmt.Printf("averageStackedLevels=%.2f\n", orderFlowStackedImbalances.Summary.AverageStackedLevels)
+		fmt.Printf("bestDirection=%s\n", orderFlowStackedImbalances.Summary.BestDirection)
+		fmt.Printf("bestDirectionFT20=%.8f\n", orderFlowStackedImbalances.Summary.BestDirectionFT20)
+		fmt.Printf("nearHVN=%d\n", orderFlowStackedImbalances.Summary.NearHVN)
+		fmt.Printf("nearVolumeCluster=%d\n", orderFlowStackedImbalances.Summary.NearVolumeCluster)
+		fmt.Printf("nearMultipleHVN=%d\n", orderFlowStackedImbalances.Summary.NearMultipleHVN)
+		fmt.Println("wrote research/orderflow_setup_stacked_imbalance.csv")
+		fmt.Println("wrote research/orderflow_setup_stacked_imbalance_summary.json")
+		fmt.Println("wrote research/orderflow_setup_stacked_imbalance.md")
+		fmt.Println()
+	}
+	if orderFlowUnfinishedBusinessOK {
+		fmt.Println("=== ORDER FLOW SETUP #5 UNFINISHED BUSINESS ===")
+		fmt.Printf("setups=%d\n", orderFlowUnfinishedBusiness.Summary.Setups)
+		fmt.Printf("unfinishedHigh=%d\n", orderFlowUnfinishedBusiness.Summary.UnfinishedHigh)
+		fmt.Printf("unfinishedLow=%d\n", orderFlowUnfinishedBusiness.Summary.UnfinishedLow)
+		fmt.Printf("revisited=%d\n", orderFlowUnfinishedBusiness.Summary.Revisited)
+		fmt.Printf("accepted=%d\n", orderFlowUnfinishedBusiness.Summary.Accepted)
+		fmt.Printf("rejected=%d\n", orderFlowUnfinishedBusiness.Summary.Rejected)
+		fmt.Printf("neutral=%d\n", orderFlowUnfinishedBusiness.Summary.Neutral)
+		fmt.Printf("magnetContexts=%d\n", orderFlowUnfinishedBusiness.Summary.MagnetContexts)
+		fmt.Printf("bestLocation=%s\n", orderFlowUnfinishedBusiness.Summary.BestLocation)
+		fmt.Printf("bestLocationRevisitRate=%.2f\n", orderFlowUnfinishedBusiness.Summary.BestLocationRevisitRate)
+		fmt.Println("wrote research/orderflow_setup_unfinished_business.csv")
+		fmt.Println("wrote research/orderflow_setup_unfinished_business_summary.json")
+		fmt.Println("wrote research/orderflow_setup_unfinished_business.md")
+		fmt.Println()
+	}
+	if orderFlowBigLimitOrdersOK {
+		fmt.Println("=== ORDER FLOW CONFIRMATION #1 BIG LIMIT ORDERS ===")
+		fmt.Printf("combinedConfirmations=%d\n", orderFlowBigLimitOrders.Summary.Combined.Confirmations)
+		fmt.Printf("liveConfirmations=%d\n", orderFlowBigLimitOrders.Summary.Sources[research.LiveMultiVenueFootprintSource].Confirmations)
+		fmt.Printf("backfillConfirmations=%d\n", orderFlowBigLimitOrders.Summary.Sources[research.BackfilledAsterAggTradesSource].Confirmations)
+		fmt.Printf("venues=%d\n", orderFlowBigLimitOrders.Summary.Combined.Venues)
+		fmt.Printf("canonicalSymbols=%d\n", orderFlowBigLimitOrders.Summary.Combined.CanonicalSymbols)
+		fmt.Printf("bullishAbsorption=%d\n", orderFlowBigLimitOrders.Summary.Combined.BullishAbsorption)
+		fmt.Printf("bearishAbsorption=%d\n", orderFlowBigLimitOrders.Summary.Combined.BearishAbsorption)
+		fmt.Printf("accepted=%d\n", orderFlowBigLimitOrders.Summary.Combined.Accepted)
+		fmt.Printf("rejected=%d\n", orderFlowBigLimitOrders.Summary.Combined.Rejected)
+		fmt.Printf("bestDirection=%s\n", orderFlowBigLimitOrders.Summary.Combined.BestDirection)
+		fmt.Printf("bestDirectionFT20=%.8f\n", orderFlowBigLimitOrders.Summary.Combined.BestDirectionFT20)
+		fmt.Printf("venueCoverage=%s\n", formatOrderFlowVenueCoverage(orderFlowBigLimitOrders.Summary.VenueCoverage))
+		fmt.Println("wrote research/orderflow_confirmation_big_limit_orders.csv")
+		fmt.Println("wrote research/orderflow_confirmation_big_limit_orders_summary.json")
+		fmt.Println("wrote research/orderflow_confirmation_big_limit_orders.md")
+		fmt.Println()
+	}
+	if orderFlowAbsorptionOK {
+		fmt.Println("=== ORDER FLOW CONFIRMATION #2 ABSORPTION ===")
+		fmt.Printf("combinedConfirmations=%d\n", orderFlowAbsorption.Summary.Combined.Confirmations)
+		fmt.Printf("liveConfirmations=%d\n", orderFlowAbsorption.Summary.SourceCoverage[research.LiveMultiVenueFootprintSource].Confirmations)
+		fmt.Printf("backfillConfirmations=%d\n", orderFlowAbsorption.Summary.SourceCoverage[research.BackfilledAsterAggTradesSource].Confirmations)
+		fmt.Printf("venues=%d\n", orderFlowAbsorption.Summary.Combined.Venues)
+		fmt.Printf("canonicalSymbols=%d\n", orderFlowAbsorption.Summary.Combined.CanonicalSymbols)
+		fmt.Printf("bullishAbsorption=%d\n", orderFlowAbsorption.Summary.Combined.BullishAbsorption)
+		fmt.Printf("bearishAbsorption=%d\n", orderFlowAbsorption.Summary.Combined.BearishAbsorption)
+		fmt.Printf("accepted=%d\n", orderFlowAbsorption.Summary.Combined.Accepted)
+		fmt.Printf("rejected=%d\n", orderFlowAbsorption.Summary.Combined.Rejected)
+		fmt.Printf("neutral=%d\n", orderFlowAbsorption.Summary.Combined.Neutral)
+		fmt.Printf("bestDirection=%s\n", orderFlowAbsorption.Summary.Combined.BestDirection)
+		fmt.Printf("bestDirectionFT20=%.8f\n", orderFlowAbsorption.Summary.Combined.BestDirectionFT20)
+		fmt.Printf("venueCoverage=%s\n", formatOrderFlowVenueCoverage(orderFlowAbsorption.Summary.VenueCoverage))
+		fmt.Println("wrote research/orderflow_confirmation_absorption.csv")
+		fmt.Println("wrote research/orderflow_confirmation_absorption_summary.json")
+		fmt.Println("wrote research/orderflow_confirmation_absorption.md")
+		fmt.Println()
+	}
+	if orderFlowAggressiveDeltaOK {
+		fmt.Println("=== ORDER FLOW CONFIRMATION #3 AGGRESSIVE DELTA ===")
+		fmt.Printf("combinedConfirmations=%d\n", orderFlowAggressiveDelta.Summary.Combined.Confirmations)
+		fmt.Printf("liveConfirmations=%d\n", orderFlowAggressiveDelta.Summary.SourceCoverage[research.LiveMultiVenueFootprintSource].Confirmations)
+		fmt.Printf("backfillConfirmations=%d\n", orderFlowAggressiveDelta.Summary.SourceCoverage[research.BackfilledAsterAggTradesSource].Confirmations)
+		fmt.Printf("venues=%d\n", orderFlowAggressiveDelta.Summary.Combined.Venues)
+		fmt.Printf("canonicalSymbols=%d\n", orderFlowAggressiveDelta.Summary.Combined.CanonicalSymbols)
+		fmt.Printf("aggressiveBuy=%d\n", orderFlowAggressiveDelta.Summary.Combined.AggressiveBuy)
+		fmt.Printf("aggressiveSell=%d\n", orderFlowAggressiveDelta.Summary.Combined.AggressiveSell)
+		fmt.Printf("accepted=%d\n", orderFlowAggressiveDelta.Summary.Combined.Accepted)
+		fmt.Printf("rejected=%d\n", orderFlowAggressiveDelta.Summary.Combined.Rejected)
+		fmt.Printf("neutral=%d\n", orderFlowAggressiveDelta.Summary.Combined.Neutral)
+		fmt.Printf("bestDirection=%s\n", orderFlowAggressiveDelta.Summary.Combined.BestDirection)
+		fmt.Printf("bestDirectionFT20=%.8f\n", orderFlowAggressiveDelta.Summary.Combined.BestDirectionFT20)
+		fmt.Printf("bestDeltaBucket=%s\n", orderFlowAggressiveDelta.Summary.Combined.BestDeltaBucket)
+		fmt.Printf("bestDeltaBucketFT20=%.8f\n", orderFlowAggressiveDelta.Summary.Combined.BestDeltaBucketFT20)
+		fmt.Printf("venueCoverage=%s\n", formatOrderFlowVenueCoverage(orderFlowAggressiveDelta.Summary.VenueCoverage))
+		fmt.Println("wrote research/orderflow_confirmation_aggressive_delta.csv")
+		fmt.Println("wrote research/orderflow_confirmation_aggressive_delta_summary.json")
+		fmt.Println("wrote research/orderflow_confirmation_aggressive_delta.md")
+		fmt.Println()
+	}
+	if orderFlowCumulativeDeltaDivergenceOK {
+		fmt.Println("=== ORDER FLOW CONFIRMATION #4 CUMULATIVE DELTA DIVERGENCE ===")
+		fmt.Printf("combinedConfirmations=%d\n", orderFlowCumulativeDeltaDivergence.Summary.Combined.Confirmations)
+		fmt.Printf("liveConfirmations=%d\n", orderFlowCumulativeDeltaDivergence.Summary.SourceCoverage[research.LiveMultiVenueFootprintSource].Confirmations)
+		fmt.Printf("backfillConfirmations=%d\n", orderFlowCumulativeDeltaDivergence.Summary.SourceCoverage[research.BackfilledAsterAggTradesSource].Confirmations)
+		fmt.Printf("venues=%d\n", orderFlowCumulativeDeltaDivergence.Summary.Combined.Venues)
+		fmt.Printf("canonicalSymbols=%d\n", orderFlowCumulativeDeltaDivergence.Summary.Combined.CanonicalSymbols)
+		fmt.Printf("bullishDivergence=%d\n", orderFlowCumulativeDeltaDivergence.Summary.Combined.BullishDivergence)
+		fmt.Printf("bearishDivergence=%d\n", orderFlowCumulativeDeltaDivergence.Summary.Combined.BearishDivergence)
+		fmt.Printf("accepted=%d\n", orderFlowCumulativeDeltaDivergence.Summary.Combined.Accepted)
+		fmt.Printf("rejected=%d\n", orderFlowCumulativeDeltaDivergence.Summary.Combined.Rejected)
+		fmt.Printf("neutral=%d\n", orderFlowCumulativeDeltaDivergence.Summary.Combined.Neutral)
+		fmt.Printf("bestDirection=%s\n", orderFlowCumulativeDeltaDivergence.Summary.Combined.BestDirection)
+		fmt.Printf("bestDirectionFT20=%.8f\n", orderFlowCumulativeDeltaDivergence.Summary.Combined.BestDirectionFT20)
+		fmt.Printf("venueCoverage=%s\n", formatOrderFlowVenueCoverage(orderFlowCumulativeDeltaDivergence.Summary.VenueCoverage))
+		fmt.Println("wrote research/orderflow_confirmation_cumulative_delta_divergence.csv")
+		fmt.Println("wrote research/orderflow_confirmation_cumulative_delta_divergence_summary.json")
+		fmt.Println("wrote research/orderflow_confirmation_cumulative_delta_divergence.md")
+		fmt.Println()
+	}
+	if orderFlowConfirmationComparisonOK {
+		fmt.Println("=== ORDER FLOW CONFIRMATION COMPARISON ===")
+		fmt.Printf("bestAcceptanceConfirmation=%s\n", orderFlowConfirmationComparison.Summary.BestAcceptanceConfirmation)
+		fmt.Printf("bestFT5Confirmation=%s\n", orderFlowConfirmationComparison.Summary.BestFT5Confirmation)
+		fmt.Printf("bestFT10Confirmation=%s\n", orderFlowConfirmationComparison.Summary.BestFT10Confirmation)
+		fmt.Printf("bestFT20Confirmation=%s\n", orderFlowConfirmationComparison.Summary.BestFT20Confirmation)
+		fmt.Printf("largestSampleConfirmation=%s\n", orderFlowConfirmationComparison.Summary.LargestSampleConfirmation)
+		fmt.Printf("broadestVenueCoverage=%s\n", orderFlowConfirmationComparison.Summary.BroadestVenueCoverage)
+		fmt.Println("wrote research/orderflow_confirmation_comparison.csv")
+		fmt.Println("wrote research/orderflow_confirmation_comparison.json")
+		fmt.Println("wrote research/orderflow_confirmation_comparison.md")
+		fmt.Println()
+	}
 	printHyperliquidL2Snapshot(hyperliquidL2Snapshot)
 	printMultiVenueL2Summary(orderBookRows.Snapshots)
 	fmt.Println("=== ORDER BOOK RESEARCH EXPORTS ===")
@@ -1684,6 +2394,441 @@ func buildVolumeProfileFinalBookPacket() volumeProfileFinalBookStudy {
 	return volumeProfileFinalBookStudy{Packet: packet}
 }
 
+func buildOrderFlowFoundationStudy() orderFlowFoundationStudy {
+	rows, summary := research.BuildOrderFlowFoundationRows(research.SyntheticOrderFlowFootprints())
+	if err := research.WriteOrderFlowFoundationCSV("research/orderflow_foundation.csv", rows); err != nil {
+		log.Fatalf("write orderflow foundation csv: %v", err)
+	}
+	if err := research.WriteOrderFlowFoundationSummaryJSON("research/orderflow_foundation_summary.json", summary); err != nil {
+		log.Fatalf("write orderflow foundation summary: %v", err)
+	}
+	return orderFlowFoundationStudy{Rows: rows, Summary: summary}
+}
+
+func buildOrderFlowDataCapabilityAuditStudy() orderFlowDataCapabilityAuditStudy {
+	report := research.BuildOrderFlowDataCapabilityAudit()
+	if err := research.WriteOrderFlowDataCapabilityAuditMarkdown("research/orderflow_data_capability_audit.md", report); err != nil {
+		log.Fatalf("write orderflow data capability audit markdown: %v", err)
+	}
+	if err := research.WriteOrderFlowDataCapabilityAuditJSON("research/orderflow_data_capability_audit.json", report); err != nil {
+		log.Fatalf("write orderflow data capability audit json: %v", err)
+	}
+	if err := research.WriteLighterTradeTapeAdapterPlanMarkdown("research/lighter_trade_tape_adapter_plan.md"); err != nil {
+		log.Fatalf("write lighter trade tape adapter plan: %v", err)
+	}
+	return orderFlowDataCapabilityAuditStudy{Report: report}
+}
+
+func buildTradeTapeAnalysis() (tradetape.TradeTapeAnalysis, bool) {
+	cfg := tradetape.DefaultRecorderConfig()
+	if _, err := os.Stat(cfg.OutputPath); err != nil {
+		log.Printf("skip trade tape analysis: %v", err)
+		return tradetape.TradeTapeAnalysis{}, false
+	}
+	analysis, err := tradetape.AnalyzeCSV(cfg.OutputPath)
+	if err != nil {
+		log.Printf("skip trade tape analysis: %v", err)
+		return tradetape.TradeTapeAnalysis{}, false
+	}
+	if err := tradetape.WriteAnalysisJSON("research/trade_tape_analysis.json", analysis); err != nil {
+		log.Fatalf("write trade tape analysis json: %v", err)
+	}
+	if err := tradetape.WriteAnalysisMarkdown("research/trade_tape_analysis.md", analysis); err != nil {
+		log.Fatalf("write trade tape analysis markdown: %v", err)
+	}
+	return analysis, true
+}
+
+func buildOrderFlowRealFootprints() (orderFlowRealFootprintsStudy, bool) {
+	cfg := tradetape.DefaultRecorderConfig()
+	if _, err := os.Stat(cfg.OutputPath); err != nil {
+		log.Printf("skip real footprint build: %v", err)
+		return orderFlowRealFootprintsStudy{}, false
+	}
+	bars, rows, summary, err := research.BuildRealFootprintReport(cfg.OutputPath)
+	if err != nil {
+		log.Printf("skip real footprint build: %v", err)
+		return orderFlowRealFootprintsStudy{}, false
+	}
+	if err := research.WriteOrderFlowRealFootprintsCSV("research/orderflow_real_footprints.csv", rows); err != nil {
+		log.Fatalf("write orderflow real footprints csv: %v", err)
+	}
+	if err := research.WriteOrderFlowRealFootprintsSummaryJSON("research/orderflow_real_footprints_summary.json", summary); err != nil {
+		log.Fatalf("write orderflow real footprints summary: %v", err)
+	}
+	if err := research.WriteOrderFlowRealFootprintsMarkdown("research/orderflow_real_footprints.md", summary); err != nil {
+		log.Fatalf("write orderflow real footprints markdown: %v", err)
+	}
+	return orderFlowRealFootprintsStudy{Bars: bars, Rows: rows, Summary: summary}, true
+}
+
+func buildOrderFlowVolumeClusters(footprintRows []research.OrderFlowRealFootprintRow, ok bool) (orderFlowVolumeClusterStudy, bool) {
+	if !ok {
+		return orderFlowVolumeClusterStudy{}, false
+	}
+	rows, summary := research.BuildOrderFlowVolumeClusterStudy(footprintRows)
+	if err := research.WriteOrderFlowVolumeClusterCSV("research/orderflow_setup_volume_cluster.csv", rows); err != nil {
+		log.Fatalf("write orderflow volume cluster csv: %v", err)
+	}
+	if err := research.WriteOrderFlowVolumeClusterSummaryJSON("research/orderflow_setup_volume_cluster_summary.json", summary); err != nil {
+		log.Fatalf("write orderflow volume cluster summary: %v", err)
+	}
+	if err := research.WriteOrderFlowVolumeClusterMarkdown("research/orderflow_setup_volume_cluster.md", rows, summary); err != nil {
+		log.Fatalf("write orderflow volume cluster markdown: %v", err)
+	}
+	return orderFlowVolumeClusterStudy{Rows: rows, Summary: summary}, true
+}
+
+func buildOrderFlowVolumeClusterQuality(ok bool) (orderFlowVolumeClusterQualityStudy, bool) {
+	if !ok {
+		return orderFlowVolumeClusterQualityStudy{}, false
+	}
+	rows, summary, err := research.BuildOrderFlowVolumeClusterQualityFromFile("research/orderflow_setup_volume_cluster.csv")
+	if err != nil {
+		log.Printf("skip orderflow volume cluster quality: %v", err)
+		return orderFlowVolumeClusterQualityStudy{}, false
+	}
+	if err := research.WriteOrderFlowVolumeClusterQualityCSV("research/orderflow_volume_cluster_quality.csv", rows); err != nil {
+		log.Fatalf("write orderflow volume cluster quality csv: %v", err)
+	}
+	if err := research.WriteOrderFlowVolumeClusterQualityJSON("research/orderflow_volume_cluster_quality.json", summary); err != nil {
+		log.Fatalf("write orderflow volume cluster quality json: %v", err)
+	}
+	if err := research.WriteOrderFlowVolumeClusterQualityMarkdown("research/orderflow_volume_cluster_quality.md", rows, summary); err != nil {
+		log.Fatalf("write orderflow volume cluster quality markdown: %v", err)
+	}
+	return orderFlowVolumeClusterQualityStudy{Rows: rows, Summary: summary}, true
+}
+
+func buildOrderFlowMultipleHVNs(footprintRows []research.OrderFlowRealFootprintRow, ok bool) (orderFlowMultipleHVNStudy, bool) {
+	if !ok {
+		return orderFlowMultipleHVNStudy{}, false
+	}
+	rows, summary := research.BuildOrderFlowMultipleHVNStudy(footprintRows)
+	if err := research.WriteOrderFlowMultipleHVNCSV("research/orderflow_setup_multiple_hvn.csv", rows); err != nil {
+		log.Fatalf("write orderflow multiple hvn csv: %v", err)
+	}
+	if err := research.WriteOrderFlowMultipleHVNSummaryJSON("research/orderflow_setup_multiple_hvn_summary.json", summary); err != nil {
+		log.Fatalf("write orderflow multiple hvn summary: %v", err)
+	}
+	clusterSummary, err := research.ReadOrderFlowVolumeClusterSummaryJSON("research/orderflow_setup_volume_cluster_summary.json")
+	if err != nil {
+		clusterSummary = research.OrderFlowVolumeClusterSummary{}
+	}
+	if err := research.WriteOrderFlowMultipleHVNMarkdown("research/orderflow_setup_multiple_hvn.md", rows, summary, clusterSummary); err != nil {
+		log.Fatalf("write orderflow multiple hvn markdown: %v", err)
+	}
+	return orderFlowMultipleHVNStudy{Rows: rows, Summary: summary}, true
+}
+
+func buildOrderFlowBackfilledFootprints() (orderFlowBackfilledFootprintsStudy, bool) {
+	path := config.DataPath("trade_tape", "backfill", "aster_btcusdt_deduped.csv")
+	if _, err := os.Stat(path); err != nil {
+		log.Printf("skip backfilled footprint replay: %v", err)
+		return orderFlowBackfilledFootprintsStudy{}, false
+	}
+	bars, rows, summary, err := research.BuildOrderFlowBackfilledFootprints(path)
+	if err != nil {
+		log.Printf("skip backfilled footprint replay: %v", err)
+		return orderFlowBackfilledFootprintsStudy{}, false
+	}
+	if err := research.WriteOrderFlowBackfilledFootprintsCSV("research/orderflow_backfilled_footprints.csv", rows); err != nil {
+		log.Fatalf("write orderflow backfilled footprints csv: %v", err)
+	}
+	if err := research.WriteOrderFlowBackfilledFootprintsSummaryJSON("research/orderflow_backfilled_footprints_summary.json", summary); err != nil {
+		log.Fatalf("write orderflow backfilled footprints summary: %v", err)
+	}
+	if err := research.WriteOrderFlowBackfilledFootprintsMarkdown("research/orderflow_backfilled_footprints.md", summary); err != nil {
+		log.Fatalf("write orderflow backfilled footprints markdown: %v", err)
+	}
+	return orderFlowBackfilledFootprintsStudy{Bars: bars, Rows: rows, Summary: summary}, true
+}
+
+func buildOrderFlowBackfilledSetupReplay(
+	footprintRows []research.OrderFlowRealFootprintRow,
+	footprintSummary research.OrderFlowBackfilledFootprintSummary,
+	ok bool,
+	liveTradeRows int,
+	liveFootprintSummary research.OrderFlowRealFootprintSummary,
+	liveVolumeClusterSummary research.OrderFlowVolumeClusterSummary,
+	liveMultipleHVNSummary research.OrderFlowMultipleHVNSummary,
+) (orderFlowBackfilledSetupReplayStudy, bool) {
+	if !ok {
+		return orderFlowBackfilledSetupReplayStudy{}, false
+	}
+	replay := research.BuildOrderFlowBackfilledSetupReplay(footprintRows)
+	if err := research.WriteOrderFlowVolumeClusterCSV("research/orderflow_backfilled_volume_cluster.csv", replay.VolumeClusterRows); err != nil {
+		log.Fatalf("write orderflow backfilled volume cluster csv: %v", err)
+	}
+	if err := research.WriteOrderFlowVolumeClusterSummaryJSON("research/orderflow_backfilled_volume_cluster_summary.json", replay.VolumeClusterSummary); err != nil {
+		log.Fatalf("write orderflow backfilled volume cluster summary: %v", err)
+	}
+	if err := research.WriteOrderFlowBackfilledVolumeClusterMarkdown("research/orderflow_backfilled_volume_cluster.md", replay.VolumeClusterRows, replay.VolumeClusterSummary); err != nil {
+		log.Fatalf("write orderflow backfilled volume cluster markdown: %v", err)
+	}
+	if err := research.WriteOrderFlowMultipleHVNCSV("research/orderflow_backfilled_multiple_hvn.csv", replay.MultipleHVNRows); err != nil {
+		log.Fatalf("write orderflow backfilled multiple hvn csv: %v", err)
+	}
+	if err := research.WriteOrderFlowMultipleHVNSummaryJSON("research/orderflow_backfilled_multiple_hvn_summary.json", replay.MultipleHVNSummary); err != nil {
+		log.Fatalf("write orderflow backfilled multiple hvn summary: %v", err)
+	}
+	if err := research.WriteOrderFlowBackfilledMultipleHVNMarkdown("research/orderflow_backfilled_multiple_hvn.md", replay.MultipleHVNRows, replay.MultipleHVNSummary, replay.VolumeClusterSummary); err != nil {
+		log.Fatalf("write orderflow backfilled multiple hvn markdown: %v", err)
+	}
+	if err := research.WriteOrderFlowVolumeClusterQualityCSV("research/orderflow_backfilled_volume_cluster_quality.csv", replay.QualityRows); err != nil {
+		log.Fatalf("write orderflow backfilled volume cluster quality csv: %v", err)
+	}
+	if err := research.WriteOrderFlowVolumeClusterQualityJSON("research/orderflow_backfilled_volume_cluster_quality.json", replay.QualitySummary); err != nil {
+		log.Fatalf("write orderflow backfilled volume cluster quality json: %v", err)
+	}
+	if err := research.WriteOrderFlowBackfilledVolumeClusterQualityMarkdown("research/orderflow_backfilled_volume_cluster_quality.md", replay.QualityRows, replay.QualitySummary); err != nil {
+		log.Fatalf("write orderflow backfilled volume cluster quality markdown: %v", err)
+	}
+	comparison := research.BuildOrderFlowLiveVsBackfillComparison(
+		liveTradeRows,
+		liveFootprintSummary,
+		liveVolumeClusterSummary,
+		liveMultipleHVNSummary,
+		footprintSummary,
+		replay.VolumeClusterSummary,
+		replay.MultipleHVNSummary,
+	)
+	if err := research.WriteOrderFlowLiveVsBackfillComparisonJSON("research/orderflow_live_vs_backfill_comparison.json", comparison); err != nil {
+		log.Fatalf("write orderflow live vs backfill comparison json: %v", err)
+	}
+	if err := research.WriteOrderFlowLiveVsBackfillComparisonMarkdown("research/orderflow_live_vs_backfill_comparison.md", comparison); err != nil {
+		log.Fatalf("write orderflow live vs backfill comparison markdown: %v", err)
+	}
+	return orderFlowBackfilledSetupReplayStudy{Replay: replay, Comparison: comparison}, true
+}
+
+func buildOrderFlowTradesFilter(
+	footprintRows []research.OrderFlowRealFootprintRow,
+	multipleHVNRows []research.OrderFlowMultipleHVNSetupRow,
+	ok bool,
+	volumeClusterSummary research.OrderFlowVolumeClusterSummary,
+	multipleHVNSummary research.OrderFlowMultipleHVNSummary,
+) (orderFlowTradesFilterStudy, bool) {
+	if !ok {
+		return orderFlowTradesFilterStudy{}, false
+	}
+	rows, summary, err := research.BuildOrderFlowTradesFilterStudyFromFile(
+		config.DataPath("trade_tape", "backfill", "aster_btcusdt_deduped.csv"),
+		footprintRows,
+		multipleHVNRows,
+	)
+	if err != nil {
+		log.Printf("skip orderflow trades filter: %v", err)
+		return orderFlowTradesFilterStudy{}, false
+	}
+	if err := research.WriteOrderFlowTradesFilterCSV("research/orderflow_setup_trades_filter.csv", rows); err != nil {
+		log.Fatalf("write orderflow trades filter csv: %v", err)
+	}
+	if err := research.WriteOrderFlowTradesFilterSummaryJSON("research/orderflow_setup_trades_filter_summary.json", summary); err != nil {
+		log.Fatalf("write orderflow trades filter summary: %v", err)
+	}
+	if err := research.WriteOrderFlowTradesFilterMarkdown("research/orderflow_setup_trades_filter.md", rows, summary, volumeClusterSummary, multipleHVNSummary); err != nil {
+		log.Fatalf("write orderflow trades filter markdown: %v", err)
+	}
+	return orderFlowTradesFilterStudy{Rows: rows, Summary: summary}, true
+}
+
+func buildOrderFlowStackedImbalances(
+	bars []orderflow.FootprintBar,
+	footprintRows []research.OrderFlowRealFootprintRow,
+	multipleHVNRows []research.OrderFlowMultipleHVNSetupRow,
+	ok bool,
+	volumeClusterSummary research.OrderFlowVolumeClusterSummary,
+	multipleHVNSummary research.OrderFlowMultipleHVNSummary,
+	tradesFilterSummary research.OrderFlowTradesFilterSummary,
+) (orderFlowStackedImbalanceStudy, bool) {
+	if !ok {
+		return orderFlowStackedImbalanceStudy{}, false
+	}
+	rows, summary := research.BuildOrderFlowStackedImbalanceStudy(bars, footprintRows, multipleHVNRows)
+	if err := research.WriteOrderFlowStackedImbalanceCSV("research/orderflow_setup_stacked_imbalance.csv", rows); err != nil {
+		log.Fatalf("write orderflow stacked imbalance csv: %v", err)
+	}
+	if err := research.WriteOrderFlowStackedImbalanceSummaryJSON("research/orderflow_setup_stacked_imbalance_summary.json", summary); err != nil {
+		log.Fatalf("write orderflow stacked imbalance summary: %v", err)
+	}
+	if err := research.WriteOrderFlowStackedImbalanceMarkdown("research/orderflow_setup_stacked_imbalance.md", rows, summary, volumeClusterSummary, multipleHVNSummary, tradesFilterSummary); err != nil {
+		log.Fatalf("write orderflow stacked imbalance markdown: %v", err)
+	}
+	return orderFlowStackedImbalanceStudy{Rows: rows, Summary: summary}, true
+}
+
+func buildOrderFlowUnfinishedBusiness(
+	bars []orderflow.FootprintBar,
+	footprintRows []research.OrderFlowRealFootprintRow,
+	ok bool,
+	volumeClusterSummary research.OrderFlowVolumeClusterSummary,
+	multipleHVNSummary research.OrderFlowMultipleHVNSummary,
+	tradesFilterSummary research.OrderFlowTradesFilterSummary,
+	stackedSummary research.OrderFlowStackedImbalanceSummary,
+) (orderFlowUnfinishedBusinessStudy, bool) {
+	if !ok {
+		return orderFlowUnfinishedBusinessStudy{}, false
+	}
+	rows, summary := research.BuildOrderFlowUnfinishedBusinessStudy(bars, footprintRows)
+	if err := research.WriteOrderFlowUnfinishedBusinessCSV("research/orderflow_setup_unfinished_business.csv", rows); err != nil {
+		log.Fatalf("write orderflow unfinished business csv: %v", err)
+	}
+	if err := research.WriteOrderFlowUnfinishedBusinessSummaryJSON("research/orderflow_setup_unfinished_business_summary.json", summary); err != nil {
+		log.Fatalf("write orderflow unfinished business summary: %v", err)
+	}
+	if err := research.WriteOrderFlowUnfinishedBusinessMarkdown("research/orderflow_setup_unfinished_business.md", rows, summary, volumeClusterSummary, multipleHVNSummary, tradesFilterSummary, stackedSummary); err != nil {
+		log.Fatalf("write orderflow unfinished business markdown: %v", err)
+	}
+	return orderFlowUnfinishedBusinessStudy{Rows: rows, Summary: summary}, true
+}
+
+func buildOrderFlowBigLimitOrders(
+	liveFootprintRows []research.OrderFlowRealFootprintRow,
+	footprintRows []research.OrderFlowRealFootprintRow,
+	tradesFilterRows []research.OrderFlowTradesFilterSetupRow,
+	ok bool,
+	tradesFilterSummary research.OrderFlowTradesFilterSummary,
+	stackedSummary research.OrderFlowStackedImbalanceSummary,
+	unfinishedSummary research.OrderFlowUnfinishedBusinessSummary,
+) (orderFlowBigLimitOrderStudy, bool) {
+	if !ok {
+		return orderFlowBigLimitOrderStudy{}, false
+	}
+	sources := []research.OrderFlowBigLimitOrderSourceInput{
+		{Source: research.LiveMultiVenueFootprintSource, FootprintRows: liveFootprintRows},
+		{Source: research.BackfilledAsterAggTradesSource, FootprintRows: footprintRows},
+	}
+	rows, summary := research.BuildOrderFlowBigLimitOrderConfirmationsForSources(sources, tradesFilterRows)
+	if err := research.WriteOrderFlowBigLimitOrderCSV("research/orderflow_confirmation_big_limit_orders.csv", rows); err != nil {
+		log.Fatalf("write orderflow big limit order csv: %v", err)
+	}
+	if err := research.WriteOrderFlowBigLimitOrderSummaryJSON("research/orderflow_confirmation_big_limit_orders_summary.json", summary); err != nil {
+		log.Fatalf("write orderflow big limit order summary: %v", err)
+	}
+	if err := research.WriteOrderFlowBigLimitOrderMarkdown("research/orderflow_confirmation_big_limit_orders.md", rows, summary, tradesFilterSummary, stackedSummary, unfinishedSummary); err != nil {
+		log.Fatalf("write orderflow big limit order markdown: %v", err)
+	}
+	return orderFlowBigLimitOrderStudy{Rows: rows, Summary: summary}, true
+}
+
+func buildOrderFlowAbsorption(
+	liveFootprintRows []research.OrderFlowRealFootprintRow,
+	footprintRows []research.OrderFlowRealFootprintRow,
+	tradesFilterRows []research.OrderFlowTradesFilterSetupRow,
+	ok bool,
+	bigLimitSummary research.OrderFlowBigLimitOrderSummary,
+	tradesFilterSummary research.OrderFlowTradesFilterSummary,
+	stackedSummary research.OrderFlowStackedImbalanceSummary,
+) (orderFlowAbsorptionStudy, bool) {
+	if !ok {
+		return orderFlowAbsorptionStudy{}, false
+	}
+	sources := []research.OrderFlowBigLimitOrderSourceInput{
+		{Source: research.LiveMultiVenueFootprintSource, FootprintRows: liveFootprintRows},
+		{Source: research.BackfilledAsterAggTradesSource, FootprintRows: footprintRows},
+	}
+	rows, summary := research.BuildOrderFlowAbsorptionConfirmationsForSources(sources, tradesFilterRows)
+	if err := research.WriteOrderFlowAbsorptionCSV("research/orderflow_confirmation_absorption.csv", rows); err != nil {
+		log.Fatalf("write orderflow absorption csv: %v", err)
+	}
+	if err := research.WriteOrderFlowAbsorptionSummaryJSON("research/orderflow_confirmation_absorption_summary.json", summary); err != nil {
+		log.Fatalf("write orderflow absorption summary: %v", err)
+	}
+	if err := research.WriteOrderFlowAbsorptionMarkdown("research/orderflow_confirmation_absorption.md", rows, summary, bigLimitSummary, tradesFilterSummary, stackedSummary); err != nil {
+		log.Fatalf("write orderflow absorption markdown: %v", err)
+	}
+	return orderFlowAbsorptionStudy{Rows: rows, Summary: summary}, true
+}
+
+func buildOrderFlowAggressiveDelta(
+	liveFootprintRows []research.OrderFlowRealFootprintRow,
+	footprintRows []research.OrderFlowRealFootprintRow,
+	tradesFilterRows []research.OrderFlowTradesFilterSetupRow,
+	ok bool,
+) (orderFlowAggressiveDeltaStudy, bool) {
+	if !ok {
+		return orderFlowAggressiveDeltaStudy{}, false
+	}
+	sources := []research.OrderFlowBigLimitOrderSourceInput{
+		{Source: research.LiveMultiVenueFootprintSource, FootprintRows: liveFootprintRows},
+		{Source: research.BackfilledAsterAggTradesSource, FootprintRows: footprintRows},
+	}
+	rows, summary := research.BuildOrderFlowAggressiveDeltaForSources(sources, tradesFilterRows)
+	if err := research.WriteOrderFlowAggressiveDeltaCSV("research/orderflow_confirmation_aggressive_delta.csv", rows); err != nil {
+		log.Fatalf("write orderflow aggressive delta csv: %v", err)
+	}
+	if err := research.WriteOrderFlowAggressiveDeltaSummaryJSON("research/orderflow_confirmation_aggressive_delta_summary.json", summary); err != nil {
+		log.Fatalf("write orderflow aggressive delta summary: %v", err)
+	}
+	if err := research.WriteOrderFlowAggressiveDeltaMarkdown("research/orderflow_confirmation_aggressive_delta.md", rows, summary); err != nil {
+		log.Fatalf("write orderflow aggressive delta markdown: %v", err)
+	}
+	return orderFlowAggressiveDeltaStudy{Rows: rows, Summary: summary}, true
+}
+
+func buildOrderFlowCumulativeDeltaDivergence(
+	liveFootprintRows []research.OrderFlowRealFootprintRow,
+	footprintRows []research.OrderFlowRealFootprintRow,
+	tradesFilterRows []research.OrderFlowTradesFilterSetupRow,
+	ok bool,
+) (orderFlowCumulativeDeltaDivergenceStudy, bool) {
+	if !ok {
+		return orderFlowCumulativeDeltaDivergenceStudy{}, false
+	}
+	sources := []research.OrderFlowBigLimitOrderSourceInput{
+		{Source: research.LiveMultiVenueFootprintSource, FootprintRows: liveFootprintRows},
+		{Source: research.BackfilledAsterAggTradesSource, FootprintRows: footprintRows},
+	}
+	rows, summary := research.BuildOrderFlowCumulativeDeltaDivergenceForSources(sources, tradesFilterRows)
+	if err := research.WriteOrderFlowCumulativeDeltaDivergenceCSV("research/orderflow_confirmation_cumulative_delta_divergence.csv", rows); err != nil {
+		log.Fatalf("write orderflow cumulative delta divergence csv: %v", err)
+	}
+	if err := research.WriteOrderFlowCumulativeDeltaDivergenceSummaryJSON("research/orderflow_confirmation_cumulative_delta_divergence_summary.json", summary); err != nil {
+		log.Fatalf("write orderflow cumulative delta divergence summary: %v", err)
+	}
+	if err := research.WriteOrderFlowCumulativeDeltaDivergenceMarkdown("research/orderflow_confirmation_cumulative_delta_divergence.md", rows, summary); err != nil {
+		log.Fatalf("write orderflow cumulative delta divergence markdown: %v", err)
+	}
+	return orderFlowCumulativeDeltaDivergenceStudy{Rows: rows, Summary: summary}, true
+}
+
+func buildOrderFlowConfirmationComparison(
+	bigLimitSummary research.OrderFlowBigLimitOrderSummary,
+	absorptionSummary research.OrderFlowAbsorptionSummary,
+	aggressiveSummary research.OrderFlowAggressiveDeltaSummary,
+	divergenceSummary research.OrderFlowCumulativeDeltaDivergenceSummary,
+	ok bool,
+) (orderFlowConfirmationComparisonStudy, bool) {
+	if !ok {
+		return orderFlowConfirmationComparisonStudy{}, false
+	}
+	rows, summary := research.BuildOrderFlowConfirmationComparison(bigLimitSummary, absorptionSummary, aggressiveSummary, divergenceSummary)
+	if err := research.WriteOrderFlowConfirmationComparisonCSV("research/orderflow_confirmation_comparison.csv", rows); err != nil {
+		log.Fatalf("write orderflow confirmation comparison csv: %v", err)
+	}
+	if err := research.WriteOrderFlowConfirmationComparisonJSON("research/orderflow_confirmation_comparison.json", summary); err != nil {
+		log.Fatalf("write orderflow confirmation comparison json: %v", err)
+	}
+	if err := research.WriteOrderFlowConfirmationComparisonMarkdown("research/orderflow_confirmation_comparison.md", rows, summary); err != nil {
+		log.Fatalf("write orderflow confirmation comparison markdown: %v", err)
+	}
+	return orderFlowConfirmationComparisonStudy{Rows: rows, Summary: summary}, true
+}
+
+func formatOrderFlowVenueCoverage(coverage map[string]research.OrderFlowVenueCoverage) string {
+	parts := make([]string, 0, 3)
+	for _, venue := range []string{"aster", "hyperliquid", "lighter"} {
+		row := coverage[venue]
+		count := row.Setups
+		if row.Confirmations > 0 || row.Setups == 0 {
+			count = row.Confirmations
+		}
+		parts = append(parts, fmt.Sprintf("%s:%d", venue, count))
+	}
+	return strings.Join(parts, ",")
+}
+
 func archivedResearchFiles() []string {
 	entries, err := os.ReadDir("research/archive")
 	if err != nil {
@@ -1852,7 +2997,7 @@ func buildVWAPL2RefreshStudy(venues []venueCandles, snapshots []orderbook.OrderB
 }
 
 func buildL2SnapshotAnalysis() (l2recorder.SnapshotAnalysis, bool) {
-	analysis, err := l2recorder.AnalyzeSnapshotCSV("data/l2_snapshots/l2_snapshots.csv")
+	analysis, err := l2recorder.AnalyzeSnapshotCSV(config.DataPath("l2", "l2_snapshots.csv"))
 	if err != nil {
 		log.Printf("skip l2 snapshot analysis: %v", err)
 		return l2recorder.SnapshotAnalysis{}, false
