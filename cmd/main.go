@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -356,47 +359,190 @@ func runLiveRuntime() {
 		log.Fatalf("init live runtime: %v", err)
 	}
 
-	universe, err := engine.SelectUniverse(cfg)
-	if err != nil {
-		log.Fatalf("select live universe: %v", err)
-	}
 	client := aster.NewClient(asterEnv("USER"), asterEnv("SIGNER"), asterEnv("PRIVATE_KEY"))
 	executor := runtime.LiveExecutor{
 		Placer: client,
 		Gate:   runtime.LiveGateFromEnv(),
 	}
 
+	ctx := runtimeContext()
+	interval := time.Duration(cfg.ScanIntervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	cycle := 0
+	fmt.Println("=== LIVE RUNTIME LOOP ===")
+	fmt.Printf("mode=%s\n", cfg.Mode)
+	fmt.Printf("gateLiveEnabled=%t\n", executor.Gate.LiveEnabled)
+	fmt.Printf("gateExecutionEnabled=%t\n", executor.Gate.ExecutionEnabled)
+	fmt.Printf("gateVenueHealthy=%t\n", executor.Gate.VenueHealthy)
+	fmt.Printf("gateAccountReady=%t\n", executor.Gate.AccountReady)
+	fmt.Printf("scanIntervalSeconds=%d\n", int(interval/time.Second))
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Println("status=stopped")
+			return
+		default:
+		}
+		cycle++
+		summary, err := runLiveCycle(engine, executor, cfg)
+		if err != nil {
+			log.Fatalf("run live cycle: %v", err)
+		}
+		fmt.Printf("cycle=%d selectedSymbols=%d decisions=%d approved=%d refused=%d placed=%d\n",
+			cycle, summary.SelectedSymbols, summary.Decisions, summary.Approved, summary.Rejected, summary.OpenCount)
+		if cfg.MaxRuntimeCycles > 0 && cycle >= cfg.MaxRuntimeCycles {
+			fmt.Println("status=max_cycles_reached")
+			return
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			fmt.Println("status=stopped")
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func runLiveCycle(engine *paper.Engine, executor runtime.LiveExecutor, cfg paper.Config) (paper.RuntimeSummary, error) {
+	summary := paper.RuntimeSummary{}
+	if err := paper.EnsureDataFiles(cfg); err != nil {
+		return summary, err
+	}
+	now := time.Now().UTC().UnixMilli()
+	if err := paper.AppendEvent(cfg, paper.TelemetryEvent{
+		Timestamp: now,
+		Type:      "MODE_SELECTED",
+		Decision:  "system",
+		Reasons:   []string{"mode=live"},
+	}); err != nil {
+		return summary, err
+	}
+	if err := paper.AppendEvent(cfg, paper.TelemetryEvent{
+		Timestamp: now,
+		Type:      "VENUE_HEALTH",
+		Decision:  "system",
+		Reasons: []string{
+			fmt.Sprintf("venueHealthy=%t", executor.Gate.VenueHealthy),
+			fmt.Sprintf("accountReady=%t", executor.Gate.AccountReady),
+			fmt.Sprintf("killSwitch=%t", executor.Gate.KillSwitchActive),
+		},
+	}); err != nil {
+		return summary, err
+	}
 	decisions := 0
 	approved := 0
 	refused := 0
 	placed := 0
+	universe, err := engine.SelectUniverse(cfg)
+	if err != nil {
+		return summary, err
+	}
+	summary.UniverseMode = universe.Mode
+	summary.Min24hVolumeUSD = universe.Min24hVolumeUSD
+	summary.SelectedSymbols = len(universe.Selected)
+	summary.Venues = len(cfg.Venues)
 	for _, entry := range universe.Selected {
 		snapshot, err := engine.FetchOrderBook(entry.Venue, entry.Symbol)
 		if err != nil {
 			log.Printf("live snapshot failed venue=%s symbol=%s: %v", entry.Venue, entry.Symbol, err)
 			continue
 		}
+		_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
+			Timestamp: time.Now().UTC().UnixMilli(),
+			Type:      "SCANNER_SNAPSHOT",
+			Symbol:    snapshot.Symbol,
+			Venue:     snapshot.Venue,
+			Mark:      orderbook.Mid(snapshot),
+			Reasons: []string{
+				fmt.Sprintf("spreadPct=%.6f", orderbook.SpreadPct(snapshot)),
+				fmt.Sprintf("liquidity=%.2f", orderbook.DepthWithinPct(snapshot, 1)),
+			},
+		})
 		candidates := engine.BuildCandidates.BuildCandidates(runtime.ContextFromOrderBook(snapshot))
 		for _, candidate := range candidates {
 			decisions++
+			_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
+				Timestamp:  time.Now().UTC().UnixMilli(),
+				Type:       "CANDIDATE_CREATED",
+				Symbol:     candidate.Symbol,
+				Venue:      candidate.Venue,
+				Side:       candidate.Side,
+				Strategy:   candidate.Strategy,
+				Playbook:   candidate.Playbook,
+				Score:      candidate.Score,
+				Confidence: candidate.Confidence,
+				Entry:      candidate.EntryPrice,
+				Reasons:    candidate.Reasons,
+			})
 			riskDecision := paper.CheckRisk(engine.State, candidate, cfg, time.Now().UTC().UnixMilli())
 			if !riskDecision.Allowed {
+				refused++
+				_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
+					Timestamp:  time.Now().UTC().UnixMilli(),
+					Type:       "RISK_REJECTED",
+					Symbol:     candidate.Symbol,
+					Venue:      candidate.Venue,
+					Side:       candidate.Side,
+					Strategy:   candidate.Strategy,
+					Playbook:   candidate.Playbook,
+					Score:      candidate.Score,
+					Confidence: candidate.Confidence,
+					Reasons:    riskDecision.Reasons,
+				})
 				continue
 			}
 			approved++
+			_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
+				Timestamp:  time.Now().UTC().UnixMilli(),
+				Type:       "EXECUTION_REQUESTED",
+				Symbol:     candidate.Symbol,
+				Venue:      candidate.Venue,
+				Side:       candidate.Side,
+				Strategy:   candidate.Strategy,
+				Playbook:   candidate.Playbook,
+				Score:      candidate.Score,
+				Confidence: candidate.Confidence,
+				Reasons:    candidate.Reasons,
+			})
 			result, err := executor.Execute(runtime.ExecutionDecision{
 				Candidate: candidate,
 				Risk:      runtime.RiskDecision{Allowed: riskDecision.Allowed, Reasons: riskDecision.Reasons},
 				Mode:      "live",
 			})
 			if err != nil {
-				log.Fatalf("execute live order: %v", err)
+				return summary, err
 			}
 			if result.Accepted {
 				placed++
+				_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
+					Timestamp: time.Now().UTC().UnixMilli(),
+					Type:      "ORDER_SUBMITTED",
+					Symbol:    candidate.Symbol,
+					Venue:     candidate.Venue,
+					Side:      candidate.Side,
+					Strategy:  candidate.Strategy,
+					Playbook:  candidate.Playbook,
+					Decision:  result.Status,
+					Reasons:   []string{result.OrderID},
+				})
 				fmt.Printf("live_order_accepted venue=%s symbol=%s orderID=%s status=%s\n", result.Venue, result.Symbol, result.OrderID, result.Status)
 			} else {
 				refused++
+				_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
+					Timestamp: time.Now().UTC().UnixMilli(),
+					Type:      "ORDER_REJECTED",
+					Symbol:    candidate.Symbol,
+					Venue:     candidate.Venue,
+					Side:      candidate.Side,
+					Strategy:  candidate.Strategy,
+					Playbook:  candidate.Playbook,
+					Decision:  result.Status,
+					Reasons:   []string{result.Message},
+				})
 				fmt.Printf("live_order_refused venue=%s symbol=%s reason=%s\n", candidate.Venue, candidate.Symbol, result.Message)
 			}
 			break
@@ -405,17 +551,28 @@ func runLiveRuntime() {
 			break
 		}
 	}
-
-	fmt.Println("=== LIVE RUNTIME ===")
-	fmt.Printf("mode=%s\n", cfg.Mode)
-	fmt.Printf("gateLiveEnabled=%t\n", executor.Gate.EnableLiveTrading)
-	fmt.Printf("gateVenueHealthy=%t\n", executor.Gate.VenueHealthy)
-	fmt.Printf("gateAccountReady=%t\n", executor.Gate.AccountReady)
-	fmt.Printf("selectedSymbols=%d\n", len(universe.Selected))
-	fmt.Printf("decisions=%d\n", decisions)
-	fmt.Printf("approved=%d\n", approved)
-	fmt.Printf("refused=%d\n", refused)
-	fmt.Printf("placed=%d\n", placed)
+	summary.Decisions = decisions
+	summary.Approved = approved
+	summary.Rejected = refused
+	summary.OpenCount = placed
+	_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
+		Timestamp: time.Now().UTC().UnixMilli(),
+		Type:      "SCANNER_CYCLE_SUMMARY",
+		Decision:  "system",
+		Reasons: []string{
+			fmt.Sprintf("decisions=%d", decisions),
+			fmt.Sprintf("approved=%d", approved),
+			fmt.Sprintf("refused=%d", refused),
+			fmt.Sprintf("placed=%d", placed),
+		},
+	})
+	_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
+		Timestamp: time.Now().UTC().UnixMilli(),
+		Type:      "RECONCILE_RESULT",
+		Decision:  "system",
+		Reasons:   []string{"live_order_reconciliation_pending"},
+	})
+	return summary, nil
 }
 
 func shouldRunFullResearchHarness() bool {
@@ -508,33 +665,332 @@ func runPaperRuntime() {
 	if err != nil {
 		log.Fatalf("init paper engine: %v", err)
 	}
-	summary, err := engine.Run()
-	if err != nil {
-		log.Fatalf("run paper engine: %v", err)
-	}
-	status := engine.StatusPayload()
-	recorders := "disabled"
-	if cfg.EnableRecorders {
-		recorders = "enabled"
-	}
-
-	fmt.Println("=== PAPER RUNTIME ===")
+	fmt.Println("=== PAPER RUNTIME LOOP ===")
 	fmt.Printf("mode=%s\n", cfg.Mode)
+	fmt.Println("execution=simulated")
 	fmt.Printf("liveEnabled=%t\n", engine.State.LiveEnabled)
-	fmt.Printf("paperEnabled=%t\n", engine.State.PaperEnabled)
-	fmt.Printf("balance=%.2f\n", status.Paper.Balance)
-	fmt.Printf("equity=%.2f\n", status.Paper.Equity)
-	fmt.Printf("universeMode=%s\n", summary.UniverseMode)
-	fmt.Printf("min24hVolumeUsd=%.0f\n", summary.Min24hVolumeUSD)
-	fmt.Printf("selectedSymbols=%d\n", summary.SelectedSymbols)
-	fmt.Printf("venues=%d\n", summary.Venues)
-	fmt.Printf("decisions=%d\n", summary.Decisions)
-	fmt.Printf("approved=%d\n", summary.Approved)
-	fmt.Printf("rejected=%d\n", summary.Rejected)
-	fmt.Printf("openPositions=%d\n", status.Paper.OpenCount)
-	fmt.Printf("recentClosed=%d\n", status.Paper.RecentClosedCount)
-	fmt.Printf("recorders=%s\n", recorders)
-	fmt.Printf("status=%s\n", "running")
+	fmt.Printf("scanIntervalSeconds=%d\n", cfg.ScanIntervalSeconds)
+	ctx := runtimeContext()
+	err = engine.RunLoop(ctx, func(snapshot paper.RuntimeLoopSnapshot) {
+		status := engine.StatusPayload()
+		fmt.Printf("cycle=%d universeMode=%s selectedSymbols=%d venues=%d decisions=%d approved=%d rejected=%d openPositions=%d equity=%.2f\n",
+			snapshot.Cycle,
+			snapshot.Summary.UniverseMode,
+			snapshot.Summary.SelectedSymbols,
+			snapshot.Summary.Venues,
+			snapshot.Summary.Decisions,
+			snapshot.Summary.Approved,
+			snapshot.Summary.Rejected,
+			status.Paper.OpenCount,
+			status.Paper.Equity,
+		)
+		printVenueDiscovery(snapshot.Summary)
+		printQualificationDiagnostics(snapshot.Summary.QualificationDiagnostics)
+		printSelectedUniverse(snapshot.Summary.SelectedUniverse, 20)
+		printOpenPositions(status.Paper.OpenPositions)
+		printRecentClosed(status.Paper.RecentClosed, 10)
+		printRejectSummary(snapshot.Summary.RejectReasons, 10)
+		printCandidateAdmission(snapshot.Summary.CandidateAdmission)
+		printApprovedBlocked(snapshot.Summary.ApprovedBlocked, 10)
+		printStateBlockers(snapshot.Summary.StateBlockers)
+		printCycleFooter(snapshot.Summary)
+	})
+	if err != nil && err != context.Canceled {
+		log.Fatalf("run paper loop: %v", err)
+	}
+	fmt.Println("status=stopped")
+}
+
+func printQualificationDiagnostics(rows []paper.QualificationDiagnostics) {
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("=== QUALIFICATION DIAGNOSTICS ===")
+	for _, row := range rows {
+		if row.Discovered == 0 {
+			continue
+		}
+		fmt.Printf("%s discovered=%d qualified=%d rejected=%d", row.Venue, row.Discovered, row.Qualified, row.Rejected)
+		if row.Discovered > 0 && row.Qualified == 0 {
+			fmt.Print(" state=all_discovered_assets_filtered")
+		}
+		fmt.Println()
+		type reasonRow struct {
+			Reason string
+			Count  int
+		}
+		reasons := make([]reasonRow, 0, len(row.Reasons))
+		for reason, count := range row.Reasons {
+			if count > 0 {
+				reasons = append(reasons, reasonRow{Reason: reason, Count: count})
+			}
+		}
+		sort.Slice(reasons, func(i, j int) bool {
+			if reasons[i].Count == reasons[j].Count {
+				return reasons[i].Reason < reasons[j].Reason
+			}
+			return reasons[i].Count > reasons[j].Count
+		})
+		limit := len(reasons)
+		if limit > 5 {
+			limit = 5
+		}
+		for i := 0; i < limit; i++ {
+			fmt.Printf("  %s=%d\n", reasons[i].Reason, reasons[i].Count)
+		}
+	}
+}
+
+func runtimeContext() context.Context {
+	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	return ctx
+}
+
+func printVenueDiscovery(summary paper.RuntimeSummary) {
+	fmt.Println()
+	fmt.Println("=== VENUE DISCOVERY ===")
+	fmt.Printf("universeMode=%s manualSymbols=%t\n", summary.UniverseMode, summary.UniverseMode == "manual")
+	if len(summary.DiscoveryStats) == 0 {
+		fmt.Println("discovery stats: unavailable")
+		return
+	}
+	for _, stat := range summary.DiscoveryStats {
+		if stat.Failed {
+			fmt.Printf("%s discovered=%d qualified=%d selected=%d failed=true error=%s\n", stat.Venue, stat.Discovered, stat.Qualified, stat.Selected, stat.Error)
+			continue
+		}
+		fmt.Printf("%s discovered=%d qualified=%d selected=%d\n", stat.Venue, stat.Discovered, stat.Qualified, stat.Selected)
+	}
+}
+
+func printSelectedUniverse(rows []paper.UniverseEntry, limitPerVenue int) {
+	fmt.Println()
+	fmt.Println("=== SELECTED UNIVERSE ===")
+	if len(rows) == 0 {
+		fmt.Println("selected universe: empty")
+		return
+	}
+	byVenue := map[string][]paper.UniverseEntry{}
+	var venues []string
+	for _, row := range rows {
+		venue := strings.ToLower(strings.TrimSpace(row.Venue))
+		if _, ok := byVenue[venue]; !ok {
+			venues = append(venues, venue)
+		}
+		byVenue[venue] = append(byVenue[venue], row)
+	}
+	sort.Strings(venues)
+	for _, venue := range venues {
+		venueRows := byVenue[venue]
+		fmt.Printf("%s:\n", venue)
+		limit := limitPerVenue
+		if limit <= 0 || limit > len(venueRows) {
+			limit = len(venueRows)
+		}
+		for i := 0; i < limit; i++ {
+			row := venueRows[i]
+			fmt.Printf("%d. %s", i+1, row.Symbol)
+			if row.CanonicalSymbol != "" && row.CanonicalSymbol != row.Symbol {
+				fmt.Printf(" canonical=%s", row.CanonicalSymbol)
+			}
+			if row.MarketID != "" {
+				fmt.Printf(" marketId=%s", row.MarketID)
+			}
+			if row.Rank > 0 {
+				fmt.Printf(" rank=%d", row.Rank)
+			}
+			if row.Volume24hUSD > 0 {
+				fmt.Printf(" vol24h=%.0f", row.Volume24hUSD)
+			}
+			fmt.Println()
+		}
+		if limit < len(venueRows) {
+			fmt.Printf("showing %d of %d selected symbols for %s\n", limit, len(venueRows), venue)
+		}
+	}
+}
+
+func printOpenPositions(positions []paper.PaperPosition) {
+	fmt.Println()
+	fmt.Println("=== OPEN POSITIONS ===")
+	if len(positions) == 0 {
+		fmt.Println("open positions: none")
+		return
+	}
+	for i, position := range positions {
+		fmt.Printf("%d. venue=%s symbol=%s side=%s strat=%q\n", i+1, position.Venue, position.Symbol, position.Side, firstNonEmpty(position.Strategy, position.Playbook))
+		fmt.Printf("   qty=%.8f entry=%.2f mark=%.2f pnl=%+.4f\n", position.Quantity, position.EntryPrice, position.MarkPrice, position.OpenPnL)
+		fmt.Printf("   stop=%.2f tp1=%.2f tp2=%.2f tp3=%.2f\n", position.Stop, position.TP1, position.TP2, position.TP3)
+		fmt.Printf("   opened=%s provenance=%s\n", formatUnixMillis(position.OpenedTime), firstNonEmpty(position.Provenance, "unknown"))
+	}
+}
+
+func printRecentClosed(positions []paper.PaperPosition, limit int) {
+	fmt.Println()
+	fmt.Println("=== RECENT CLOSED ===")
+	if len(positions) == 0 {
+		fmt.Println("recent closed: none")
+		return
+	}
+	if limit <= 0 || limit > len(positions) {
+		limit = len(positions)
+	}
+	for i := 0; i < limit; i++ {
+		position := positions[i]
+		hold := time.Duration(0)
+		if position.OpenedTime > 0 && position.ClosedTime > position.OpenedTime {
+			hold = time.Duration(position.ClosedTime-position.OpenedTime) * time.Millisecond
+		}
+		fmt.Printf("%d. venue=%s symbol=%s side=%s exit=%s realized=%+.4f hold=%s strat=%q\n",
+			i+1,
+			position.Venue,
+			position.Symbol,
+			position.Side,
+			firstNonEmpty(position.ExitReason, "unknown"),
+			position.RealizedPnL,
+			formatDuration(hold),
+			firstNonEmpty(position.Strategy, position.Playbook),
+		)
+	}
+}
+
+func printStateBlockers(blockers paper.StateBlockers) {
+	fmt.Println()
+	fmt.Println("=== STATE BLOCKERS ===")
+	fmt.Printf("stateBlockers=%t cooldownSymbols=%d symbolsAtDailyMax=%d lossCooldownActive=%t openSlots=%d maxOpenPositions=%d openPositionBlocked=%t\n",
+		blockers.Active,
+		blockers.CooldownSymbols,
+		blockers.SymbolsAtDailyMax,
+		blockers.LossCooldownActive,
+		blockers.OpenPositionSlots,
+		blockers.MaxOpenPositions,
+		blockers.OpenPositionBlocked,
+	)
+}
+
+func printCycleFooter(summary paper.RuntimeSummary) {
+	fmt.Println()
+	fmt.Println("=== CYCLE DIAGNOSIS ===")
+	if summary.Approved == 0 && summary.Rejected > 0 {
+		stateRejects := rejectCount(summary.RejectReasons, "max_open_positions", "max_trades_per_symbol_per_day", "trade_budget_exceeded", "symbol_cooldown", "symbol_lock", "loss_cooldown")
+		riskRejects := rejectCount(summary.RejectReasons, "poor_rr", "funding_hazard", "spread_too_wide", "insufficient_liquidity", "invalid_bracket_geometry")
+		strategyRejects := rejectCount(summary.RejectReasons, "no_runtime_candidate", "no_live_signal_mapping_yet")
+		fmt.Printf("approved=0 rejected=%d stateRejects=%d riskRejects=%d strategyRejects=%d\n", summary.Rejected, stateRejects, riskRejects, strategyRejects)
+		if stateRejects > 0 {
+			fmt.Println("diagnosis=saved_state_or_limits_blocking_entries")
+		} else if riskRejects > 0 {
+			fmt.Println("diagnosis=risk_filters_blocking_entries")
+		} else if strategyRejects > 0 {
+			fmt.Println("diagnosis=strategy_mapping_or_candidate_generation_blocking_entries")
+		} else {
+			fmt.Println("diagnosis=no_approved_candidates")
+		}
+		return
+	}
+	fmt.Printf("approved=%d rejected=%d openPositions=%d\n", summary.Approved, summary.Rejected, summary.OpenCount)
+}
+
+func rejectCount(reasons map[string]int, keys ...string) int {
+	total := 0
+	for _, key := range keys {
+		total += reasons[key]
+	}
+	return total
+}
+
+func printRejectSummary(reasons map[string]int, limit int) {
+	fmt.Println()
+	fmt.Println("=== REJECT SUMMARY ===")
+	if len(reasons) == 0 {
+		fmt.Println("reject summary: none")
+		return
+	}
+	type row struct {
+		Reason string
+		Count  int
+	}
+	rows := make([]row, 0, len(reasons))
+	for reason, count := range reasons {
+		if reason != "" && count > 0 {
+			rows = append(rows, row{Reason: reason, Count: count})
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Count == rows[j].Count {
+			return rows[i].Reason < rows[j].Reason
+		}
+		return rows[i].Count > rows[j].Count
+	})
+	if limit <= 0 || limit > len(rows) {
+		limit = len(rows)
+	}
+	for i := 0; i < limit; i++ {
+		fmt.Printf("%s: %d\n", rows[i].Reason, rows[i].Count)
+	}
+}
+
+func printApprovedBlocked(outcomes []paper.CandidateOutcome, limit int) {
+	if len(outcomes) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("=== CANDIDATE BLOCKS ===")
+	if limit <= 0 || limit > len(outcomes) {
+		limit = len(outcomes)
+	}
+	for i := 0; i < limit; i++ {
+		outcome := outcomes[i]
+		candidate := outcome.Candidate
+		fmt.Printf("%d. venue=%s symbol=%s side=%s strat=%q score=%.2f confidence=%.2f\n", i+1, candidate.Venue, candidate.Symbol, candidate.Side, candidate.Strategy, candidate.Score, candidate.Confidence)
+		fmt.Printf("   entry=%.2f stop=%.2f tp1=%.2f status=%s reason=%s\n", candidate.EntryPrice, candidate.StopPrice, candidate.TP1, outcome.Status, outcome.Reason)
+	}
+}
+
+func printCandidateAdmission(rows []paper.CandidateAdmissionSummary) {
+	fmt.Println()
+	fmt.Println("=== CANDIDATE ADMISSION ===")
+	if len(rows) == 0 {
+		fmt.Println("candidate admission: none")
+		return
+	}
+	for _, row := range rows {
+		fmt.Printf("%s created=%d approved=%d deduped=%d portfolioBlocked=%d stateBlocked=%d riskRejected=%d\n",
+			row.Venue,
+			row.Created,
+			row.Approved,
+			row.Deduped,
+			row.PortfolioBlocked,
+			row.StateBlocked,
+			row.RiskRejected,
+		)
+	}
+}
+
+func formatUnixMillis(value int64) string {
+	if value <= 0 {
+		return "unknown"
+	}
+	return time.UnixMilli(value).UTC().Format(time.RFC3339)
+}
+
+func formatDuration(value time.Duration) string {
+	if value <= 0 {
+		return "unknown"
+	}
+	if value < time.Hour {
+		return value.Round(time.Second).String()
+	}
+	return value.Round(time.Minute).String()
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func buildBookTradeRules() bookTradeRulesStudy {

@@ -10,30 +10,40 @@ import (
 )
 
 type LiveGate struct {
-	EnableLiveTrading bool
-	VenueHealthy      bool
-	AccountReady      bool
-	AllowedVenues     map[string]bool
+	LiveEnabled      bool
+	ExecutionEnabled bool
+	VenueHealthy     bool
+	AccountReady     bool
+	KillSwitchActive bool
+	AllowedVenues    map[string]bool
 }
 
 func LiveGateFromEnv() LiveGate {
 	return LiveGate{
-		EnableLiveTrading: envBool("LIVE_ENABLE_LIVE_TRADING") || envBool("ENABLE_LIVE_ORDERS"),
-		VenueHealthy:      envDefaultBool("LIVE_VENUE_HEALTHY", true),
-		AccountReady:      envDefaultBool("LIVE_ACCOUNT_READY", false),
-		AllowedVenues:     allowedSet(os.Getenv("LIVE_ALLOWED_VENUES")),
+		LiveEnabled:      envBool("LIVE_ENABLE_LIVE_TRADING"),
+		ExecutionEnabled: envBool("ENABLE_LIVE_ORDERS"),
+		VenueHealthy:     envDefaultBool("LIVE_VENUE_HEALTHY", true),
+		AccountReady:     envDefaultBool("LIVE_ACCOUNT_READY", false),
+		KillSwitchActive: envBool("LIVE_KILL_SWITCH"),
+		AllowedVenues:    allowedSet(os.Getenv("LIVE_ALLOWED_VENUES")),
 	}
 }
 
 func (g LiveGate) Refusal(candidate Candidate) string {
-	if !g.EnableLiveTrading {
+	if !g.LiveEnabled {
 		return "live_trading_not_enabled"
+	}
+	if !g.ExecutionEnabled {
+		return "execution_not_enabled"
 	}
 	if !g.VenueHealthy {
 		return "venue_not_healthy"
 	}
 	if !g.AccountReady {
 		return "account_not_ready"
+	}
+	if g.KillSwitchActive {
+		return "kill_switch_active"
 	}
 	if len(g.AllowedVenues) > 0 && !g.AllowedVenues[strings.ToLower(candidate.Venue)] {
 		return "venue_not_allowed"

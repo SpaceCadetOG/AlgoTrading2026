@@ -2,6 +2,7 @@ package paper
 
 import (
 	"math"
+	"strings"
 
 	runtime "AlgoTrading2026/internal/runtime"
 )
@@ -15,22 +16,23 @@ type RiskDecision struct {
 
 func CheckRisk(state EngineState, candidate Candidate, cfg Config, nowMS int64) RiskDecision {
 	reasons := []string{}
+	key := candidateStateKey(candidate)
 	if len(state.OpenPositions) >= cfg.MaxOpenPositions {
 		reasons = append(reasons, "max_open_positions")
 	}
 	if state.LossCooldownUntil > nowMS {
 		reasons = append(reasons, "loss_cooldown")
 	}
-	if until := state.SymbolCooldowns[candidate.Symbol]; until > nowMS {
+	if until := state.SymbolCooldowns[key]; until > nowMS {
 		reasons = append(reasons, "symbol_cooldown")
 	}
-	if until := state.SymbolLocks[candidate.Symbol]; until > nowMS {
+	if until := state.SymbolLocks[key]; until > nowMS {
 		reasons = append(reasons, "symbol_lock")
 	}
-	if state.DailyTradeCount[candidate.Symbol] >= cfg.MaxOpenPositions {
+	if state.DailyTradeCount[key] >= cfg.MaxOpenPositions {
 		reasons = append(reasons, "trade_budget_exceeded")
 	}
-	if state.DailyTradeCount[candidate.Symbol] >= cfg.MaxTradesPerSymbolPerDay {
+	if state.DailyTradeCount[key] >= cfg.MaxTradesPerSymbolPerDay {
 		reasons = append(reasons, "max_trades_per_symbol_per_day")
 	}
 	if !validBracket(candidate) {
@@ -49,6 +51,23 @@ func CheckRisk(state EngineState, candidate Candidate, cfg Config, nowMS int64) 
 		reasons = append(reasons, "insufficient_liquidity")
 	}
 	return RiskDecision{Allowed: len(reasons) == 0, Reasons: reasons}
+}
+
+func candidateStateKey(candidate Candidate) string {
+	return venueSymbolKey(candidate.Venue, candidate.Symbol)
+}
+
+func positionStateKey(position PaperPosition) string {
+	return venueSymbolKey(position.Venue, position.Symbol)
+}
+
+func venueSymbolKey(venue string, symbol string) string {
+	venue = strings.ToLower(strings.TrimSpace(venue))
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if venue == "" {
+		return symbol
+	}
+	return venue + ":" + symbol
 }
 
 func rewardToRisk(candidate Candidate) float64 {

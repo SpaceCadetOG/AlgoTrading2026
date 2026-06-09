@@ -56,6 +56,7 @@ func tempConfig(t *testing.T) Config {
 	dir := t.TempDir()
 	cfg := DefaultConfig()
 	cfg.Mode = "paper"
+	cfg.UniverseMode = "manual"
 	cfg.StatePath = filepath.Join(dir, "state.json")
 	cfg.PositionsPath = filepath.Join(dir, "positions.json")
 	cfg.TradesPath = filepath.Join(dir, "trades.csv")
@@ -64,6 +65,12 @@ func tempConfig(t *testing.T) Config {
 	cfg.FundingPath = filepath.Join(dir, "funding.csv")
 	cfg.UniverseCSVPath = filepath.Join(dir, "universe.csv")
 	cfg.UniverseJSONPath = filepath.Join(dir, "universe.json")
+	cfg.DiscoveredUniversePath = filepath.Join(dir, "discovered_universe.json")
+	cfg.QualifiedUniversePath = filepath.Join(dir, "qualified_universe.json")
+	cfg.SelectedUniversePath = filepath.Join(dir, "selected_universe.json")
+	cfg.QualificationDiagnosticsPath = filepath.Join(dir, "qualification_diagnostics.json")
+	cfg.SummaryJSONPath = filepath.Join(dir, "summary.json")
+	cfg.RejectSummaryJSONPath = filepath.Join(dir, "reject_summary.json")
 	return cfg
 }
 

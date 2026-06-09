@@ -29,6 +29,8 @@ type PaperPosition struct {
 	FundingPaid     float64  `json:"fundingPaid"`
 	OpenedTime      int64    `json:"openedTime"`
 	UpdatedTime     int64    `json:"updatedTime"`
+	ClosedTime      int64    `json:"closedTime,omitempty"`
+	ExitReason      string   `json:"exitReason,omitempty"`
 	MFER            float64  `json:"mfer"`
 	MAER            float64  `json:"maer"`
 	EntryReasons    []string `json:"entryReasons"`

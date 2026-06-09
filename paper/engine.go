@@ -1,8 +1,10 @@
 package paper
 
 import (
+	"context"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,22 +31,66 @@ type Engine struct {
 }
 
 type RuntimeSummary struct {
-	Decisions        int
-	Approved         int
-	Rejected         int
-	OpenCount        int
-	RecentClosed     int
-	RecordersEnabled bool
-	UniverseMode     string
-	Min24hVolumeUSD  float64
-	SelectedSymbols  int
-	Venues           int
+	Decisions                int
+	Approved                 int
+	Rejected                 int
+	OpenCount                int
+	RecentClosed             int
+	RecordersEnabled         bool
+	UniverseMode             string
+	Min24hVolumeUSD          float64
+	SelectedSymbols          int
+	Venues                   int
+	SelectedUniverse         []UniverseEntry
+	DiscoveryStats           []VenueDiscoveryStats
+	QualificationDiagnostics []QualificationDiagnostics
+	RejectReasons            map[string]int
+	ApprovedBlocked          []CandidateOutcome
+	CandidateAdmission       []CandidateAdmissionSummary
+	StateBlockers            StateBlockers
+	Mode                     string
+	ExecutionMode            string
+	LiveEnabled              bool
+}
+
+type StateBlockers struct {
+	Active              bool `json:"active"`
+	CooldownSymbols     int  `json:"cooldownSymbols"`
+	SymbolsAtDailyMax   int  `json:"symbolsAtDailyMax"`
+	LossCooldownActive  bool `json:"lossCooldownActive"`
+	OpenPositionSlots   int  `json:"openPositionSlots"`
+	MaxOpenPositions    int  `json:"maxOpenPositions"`
+	OpenPositionBlocked bool `json:"openPositionBlocked"`
+}
+
+type CandidateOutcome struct {
+	Candidate Candidate `json:"candidate"`
+	Status    string    `json:"status"`
+	Reason    string    `json:"reason"`
+}
+
+type CandidateAdmissionSummary struct {
+	Venue            string `json:"venue"`
+	Created          int    `json:"created"`
+	Approved         int    `json:"approved"`
+	Deduped          int    `json:"deduped"`
+	PortfolioBlocked int    `json:"portfolioBlocked"`
+	RiskRejected     int    `json:"riskRejected"`
+	StateBlocked     int    `json:"stateBlocked"`
+}
+
+type RuntimeLoopSnapshot struct {
+	Cycle   int
+	Summary RuntimeSummary
 }
 
 type scanCounts struct {
-	Decisions int
-	Approved  int
-	Rejected  int
+	Decisions       int
+	Approved        int
+	Rejected        int
+	RejectReasons   map[string]int
+	ApprovedBlocked []CandidateOutcome
+	Admission       map[string]*CandidateAdmissionSummary
 }
 
 func NewEngine(cfg Config) (*Engine, error) {
@@ -52,6 +98,7 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	applyResetFlags(&state, cfg)
 	engine := &Engine{
 		Config:           cfg,
 		State:            state,
@@ -74,8 +121,46 @@ func NewEngine(cfg Config) (*Engine, error) {
 	return engine, nil
 }
 
+func applyResetFlags(state *EngineState, cfg Config) {
+	if cfg.ResetAll {
+		*state = NewState(cfg)
+		return
+	}
+	if cfg.ResetState || cfg.ResetCooldowns {
+		state.SymbolCooldowns = map[string]int64{}
+		state.SymbolLocks = map[string]int64{}
+		state.LossCooldownUntil = 0
+	}
+	if cfg.ResetState || cfg.ResetDailyCounts {
+		state.DailyTradeCount = map[string]int{}
+		state.TradeBudgetUsed = 0
+		state.RealizedToday = 0
+	}
+	if cfg.ResetState {
+		state.RecentDecisions = nil
+		state.RecentClosed = nil
+	}
+	if cfg.ResetOpenPositions {
+		state.OpenPositions = nil
+		state.OpenCount = 0
+		state.Reserve = 0
+	}
+	if cfg.ResetRecentClosed {
+		state.RecentClosed = nil
+	}
+}
+
 func (e *Engine) Run() (RuntimeSummary, error) {
-	summary := RuntimeSummary{RecordersEnabled: e.Config.EnableRecorders}
+	return e.RunOnce()
+}
+
+func (e *Engine) RunOnce() (RuntimeSummary, error) {
+	summary := RuntimeSummary{
+		RecordersEnabled: e.Config.EnableRecorders,
+		Mode:             firstNonEmpty(e.Config.Mode, "paper"),
+		ExecutionMode:    "simulated",
+		LiveEnabled:      e.State.LiveEnabled,
+	}
 	if err := EnsureDataFiles(e.Config); err != nil {
 		return summary, err
 	}
@@ -88,10 +173,10 @@ func (e *Engine) Run() (RuntimeSummary, error) {
 	}
 	if err := AppendEvent(e.Config, TelemetryEvent{
 		Timestamp: now,
-		Type:      "paper_runtime_started",
+		Type:      "MODE_SELECTED",
 		Decision:  "system",
 		Reasons: []string{
-			"dry_run",
+			"mode=paper",
 			"live_disabled",
 			"execution_disabled",
 		},
@@ -112,6 +197,9 @@ func (e *Engine) Run() (RuntimeSummary, error) {
 	summary.Min24hVolumeUSD = universe.Min24hVolumeUSD
 	summary.SelectedSymbols = len(universe.Selected)
 	summary.Venues = uniqueUniverseVenues(universe.Selected)
+	summary.SelectedUniverse = append([]UniverseEntry(nil), universe.Selected...)
+	summary.DiscoveryStats = append([]VenueDiscoveryStats(nil), universe.Stats...)
+	summary.QualificationDiagnostics = append([]QualificationDiagnostics(nil), universe.Diagnostics...)
 	for _, note := range universe.Notes {
 		e.recordSystemEvent("universe_notice", []string{note})
 	}
@@ -122,9 +210,71 @@ func (e *Engine) Run() (RuntimeSummary, error) {
 	summary.Decisions = counts.Decisions
 	summary.Approved = counts.Approved
 	summary.Rejected = counts.Rejected
+	summary.RejectReasons = counts.RejectReasons
+	summary.ApprovedBlocked = append([]CandidateOutcome(nil), counts.ApprovedBlocked...)
+	summary.CandidateAdmission = admissionSummaryRows(counts.Admission)
 	summary.OpenCount = len(e.State.OpenPositions)
 	summary.RecentClosed = len(e.State.RecentClosed)
+	summary.StateBlockers = BuildStateBlockers(e.State, e.Config, e.Now().UTC().UnixMilli())
+	if err := e.recordScannerCycleSummary(summary); err != nil {
+		return summary, err
+	}
+	if err := WriteRuntimeSummaryJSON(e.Config, summary, e.State); err != nil {
+		return summary, err
+	}
+	if err := WriteRejectSummaryJSON(e.Config, summary.RejectReasons); err != nil {
+		return summary, err
+	}
 	return summary, SaveState(e.Config, e.State)
+}
+
+func (e *Engine) RunLoop(ctx context.Context, onCycle func(RuntimeLoopSnapshot)) error {
+	interval := time.Duration(e.Config.ScanIntervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	maxCycles := e.Config.MaxRuntimeCycles
+	cycle := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		cycle++
+		summary, err := e.RunOnce()
+		if err != nil {
+			return err
+		}
+		if onCycle != nil {
+			onCycle(RuntimeLoopSnapshot{Cycle: cycle, Summary: summary})
+		}
+		if err := AppendEvent(e.Config, TelemetryEvent{
+			Timestamp: e.Now().UTC().UnixMilli(),
+			Type:      "HEARTBEAT",
+			Decision:  "system",
+			Reasons: []string{
+				fmt.Sprintf("cycle=%d", cycle),
+				fmt.Sprintf("decisions=%d", summary.Decisions),
+				fmt.Sprintf("approved=%d", summary.Approved),
+				fmt.Sprintf("openPositions=%d", summary.OpenCount),
+			},
+		}); err != nil {
+			return err
+		}
+		if maxCycles > 0 && cycle >= maxCycles {
+			return nil
+		}
+
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (e *Engine) EvaluateCandidate(candidate Candidate, snapshot orderbook.OrderBookSnapshot, thinSession bool) (RiskDecision, *PaperPosition, error) {
@@ -132,11 +282,13 @@ func (e *Engine) EvaluateCandidate(candidate Candidate, snapshot orderbook.Order
 	decision := CheckRisk(e.State, candidate, e.Config, now)
 	e.recordDecision(candidate, decision, now)
 	if !decision.Allowed {
+		e.recordCandidateEvent("RISK_REJECTED", candidate, now, decision.Reasons)
 		if err := SaveState(e.Config, e.State); err != nil {
 			return decision, nil, err
 		}
 		return decision, nil, nil
 	}
+	e.recordCandidateEvent("RISK_APPROVED", candidate, now, decision.Reasons)
 
 	fill, err := SimulateEntryFill(snapshot, candidate.Side, candidate.Quantity, thinSession, e.Config)
 	if err != nil {
@@ -179,7 +331,7 @@ func (e *Engine) EvaluateCandidate(candidate Candidate, snapshot orderbook.Order
 	e.State.Reserve += position.Margin
 	e.State.OpenPositions = append(e.State.OpenPositions, position)
 	e.State.OpenCount = len(e.State.OpenPositions)
-	e.State.DailyTradeCount[candidate.Symbol]++
+	e.State.DailyTradeCount[candidateStateKey(candidate)]++
 	e.revalue()
 	if err := SaveState(e.Config, e.State); err != nil {
 		return decision, nil, err
@@ -187,6 +339,25 @@ func (e *Engine) EvaluateCandidate(candidate Candidate, snapshot orderbook.Order
 	if err := AppendEvent(e.Config, TelemetryEvent{
 		Timestamp:    now,
 		Type:         "open",
+		Symbol:       position.Symbol,
+		Venue:        position.Venue,
+		Side:         position.Side,
+		Strategy:     position.Strategy,
+		Playbook:     position.Playbook,
+		Score:        position.Score,
+		Confidence:   position.Confidence,
+		Decision:     "approved",
+		Entry:        position.EntryPrice,
+		Mark:         position.MarkPrice,
+		Last:         position.LastPrice,
+		Reasons:      candidate.Reasons,
+		StopDistance: math.Abs(position.EntryPrice - position.Stop),
+	}); err != nil {
+		return decision, nil, err
+	}
+	if err := AppendEvent(e.Config, TelemetryEvent{
+		Timestamp:    now,
+		Type:         "POSITION_OPENED",
 		Symbol:       position.Symbol,
 		Venue:        position.Venue,
 		Side:         position.Side,
@@ -220,14 +391,48 @@ func (e *Engine) ManagePosition(index int, snapshot orderbook.OrderBookSnapshot,
 	if exit.Action == "" {
 		e.State.OpenPositions[index] = position
 		e.revalue()
+		_ = AppendEvent(e.Config, TelemetryEvent{
+			Timestamp: e.Now().UTC().UnixMilli(),
+			Type:      "POSITION_UPDATED",
+			Symbol:    position.Symbol,
+			Venue:     position.Venue,
+			Side:      position.Side,
+			Strategy:  position.Strategy,
+			Playbook:  position.Playbook,
+			Mark:      position.MarkPrice,
+			Last:      position.LastPrice,
+			Reasons:   []string{"mark_to_market"},
+		})
 		return SaveState(e.Config, e.State)
 	}
 	if exit.UpgradeBreakEven {
 		position.Stop = position.EntryPrice
 		position.BreakEvenPrice = position.EntryPrice
+		_ = AppendEvent(e.Config, TelemetryEvent{
+			Timestamp: e.Now().UTC().UnixMilli(),
+			Type:      "STOP_MOVED",
+			Symbol:    position.Symbol,
+			Venue:     position.Venue,
+			Side:      position.Side,
+			Strategy:  position.Strategy,
+			Playbook:  position.Playbook,
+			Entry:     position.EntryPrice,
+			Reasons:   []string{"break_even"},
+		})
 	}
 	if exit.NewTrailingStop != 0 {
 		position.TrailingStop = exit.NewTrailingStop
+		_ = AppendEvent(e.Config, TelemetryEvent{
+			Timestamp: e.Now().UTC().UnixMilli(),
+			Type:      "TRAILING_UPDATED",
+			Symbol:    position.Symbol,
+			Venue:     position.Venue,
+			Side:      position.Side,
+			Strategy:  position.Strategy,
+			Playbook:  position.Playbook,
+			Exit:      position.TrailingStop,
+			Reasons:   []string{"tp2_trailing_stop"},
+		})
 	}
 	closeQty := position.Quantity * exit.ClosePct
 	fill, err := SimulateExitFill(snapshot, exitSide(position.Side), closeQty, false, exit.Reason == "hard_stop", exit.ForceFlat, e.Config)
@@ -275,14 +480,40 @@ func (e *Engine) ManagePosition(index int, snapshot orderbook.OrderBookSnapshot,
 		return err
 	}
 	if position.Quantity <= 0.0000001 || exit.Action == "close" {
+		position.ClosedTime = position.UpdatedTime
+		position.ExitReason = exit.Reason
 		e.State.RecentClosed = append([]PaperPosition{position}, e.State.RecentClosed...)
 		if len(e.State.RecentClosed) > 10 {
 			e.State.RecentClosed = e.State.RecentClosed[:10]
 		}
 		e.State.OpenPositions = append(e.State.OpenPositions[:index], e.State.OpenPositions[index+1:]...)
-		e.State.SymbolCooldowns[position.Symbol] = position.UpdatedTime + int64(time.Hour/time.Millisecond)
+		e.State.SymbolCooldowns[positionStateKey(position)] = position.UpdatedTime + int64(time.Hour/time.Millisecond)
+		_ = AppendEvent(e.Config, TelemetryEvent{
+			Timestamp:   position.UpdatedTime,
+			Type:        "POSITION_CLOSED",
+			Symbol:      position.Symbol,
+			Venue:       position.Venue,
+			Side:        position.Side,
+			Strategy:    position.Strategy,
+			Playbook:    position.Playbook,
+			Exit:        fill.AveragePrice,
+			RealizedPnL: realized,
+			Reasons:     []string{exit.Reason},
+		})
 	} else {
 		e.State.OpenPositions[index] = position
+		_ = AppendEvent(e.Config, TelemetryEvent{
+			Timestamp:   position.UpdatedTime,
+			Type:        "PARTIAL_EXIT",
+			Symbol:      position.Symbol,
+			Venue:       position.Venue,
+			Side:        position.Side,
+			Strategy:    position.Strategy,
+			Playbook:    position.Playbook,
+			Exit:        fill.AveragePrice,
+			RealizedPnL: realized,
+			Reasons:     []string{exit.Reason},
+		})
 	}
 	e.State.OpenCount = len(e.State.OpenPositions)
 	e.revalue()
@@ -363,6 +594,24 @@ func (e *Engine) recordDecision(candidate Candidate, decision RiskDecision, now 
 	_ = AppendEvent(e.Config, event)
 }
 
+func (e *Engine) recordCandidateEvent(eventType string, candidate Candidate, now int64, reasons []string) {
+	event := TelemetryEvent{
+		Timestamp:    now,
+		Type:         eventType,
+		Symbol:       candidate.Symbol,
+		Venue:        candidate.Venue,
+		Side:         candidate.Side,
+		Strategy:     candidate.Strategy,
+		Playbook:     candidate.Playbook,
+		Score:        candidate.Score,
+		Confidence:   candidate.Confidence,
+		Entry:        candidate.EntryPrice,
+		Reasons:      append([]string(nil), reasons...),
+		StopDistance: math.Abs(candidate.EntryPrice - candidate.StopPrice),
+	}
+	_ = AppendEvent(e.Config, event)
+}
+
 func (e *Engine) revalue() {
 	openPnL := 0.0
 	for i := range e.State.OpenPositions {
@@ -426,7 +675,7 @@ func (e *Engine) decisionCounts() (int, int, int) {
 }
 
 func (e *Engine) scanOnce(universe []UniverseEntry) (scanCounts, error) {
-	counts := scanCounts{}
+	counts := scanCounts{RejectReasons: map[string]int{}, Admission: map[string]*CandidateAdmissionSummary{}}
 	snapshots := make([]orderbook.OrderBookSnapshot, 0)
 	for _, entry := range universe {
 		snapshot, err := e.FetchOrderBook(entry.Venue, entry.Symbol)
@@ -435,6 +684,17 @@ func (e *Engine) scanOnce(universe []UniverseEntry) (scanCounts, error) {
 			continue
 		}
 		snapshots = append(snapshots, snapshot)
+		_ = AppendEvent(e.Config, TelemetryEvent{
+			Timestamp: e.Now().UTC().UnixMilli(),
+			Type:      "SCANNER_SNAPSHOT",
+			Symbol:    snapshot.Symbol,
+			Venue:     snapshot.Venue,
+			Mark:      orderbook.Mid(snapshot),
+			Reasons: []string{
+				fmt.Sprintf("spreadPct=%.6f", orderbook.SpreadPct(snapshot)),
+				fmt.Sprintf("liquidity=%.2f", orderbook.DepthWithinPct(snapshot, 1)),
+			},
+		})
 	}
 
 	for i := len(e.State.OpenPositions) - 1; i >= 0; i-- {
@@ -458,27 +718,197 @@ func (e *Engine) scanOnce(universe []UniverseEntry) (scanCounts, error) {
 					Strategy: "runtime_playbooks", Playbook: "runtime_playbooks", Side: "LONG",
 					EntryPrice: orderbook.Mid(snapshot),
 				}, RiskDecision{Allowed: false, Reasons: []string{"no_runtime_candidate"}}, e.Now().UTC().UnixMilli())
+				e.recordSystemEvent("CANDIDATE_REJECTED", []string{"no_runtime_candidate", snapshot.Venue, snapshot.Symbol})
 				counts.Decisions++
 				counts.Rejected++
+				counts.RejectReasons["no_runtime_candidate"]++
 				continue
 			}
+			e.recordSystemEvent("CANDIDATE_CREATED", []string{"synthetic_test_candidate", snapshot.Venue, snapshot.Symbol})
 			candidates = []Candidate{candidate}
 		}
+		candidates, deduped := e.dedupeCandidates(candidates)
+		for _, candidate := range deduped {
+			admissionFor(counts.Admission, candidate.Venue).Created++
+			admissionFor(counts.Admission, candidate.Venue).Deduped++
+			counts.Decisions++
+			counts.Rejected++
+			counts.RejectReasons["deduped_out"]++
+			outcome := CandidateOutcome{Candidate: candidate, Status: "deduped_out", Reason: "same_venue_symbol_side"}
+			counts.ApprovedBlocked = append(counts.ApprovedBlocked, outcome)
+			e.recordCandidateEvent("CANDIDATE_REJECTED", candidate, e.Now().UTC().UnixMilli(), []string{"deduped_out", "same_venue_symbol_side"})
+		}
 		for _, candidate := range candidates {
-			decision, _, err := e.EvaluateCandidate(candidate, snapshot, false)
+			admissionFor(counts.Admission, candidate.Venue).Created++
+			e.recordCandidateEvent("CANDIDATE_CREATED", candidate, e.Now().UTC().UnixMilli(), candidate.Reasons)
+			if reason := e.positionPolicyBlockReason(candidate); reason != "" {
+				now := e.Now().UTC().UnixMilli()
+				e.recordDecision(candidate, RiskDecision{Allowed: false, Reasons: []string{reason}}, now)
+				e.recordCandidateEvent("CANDIDATE_REJECTED", candidate, now, []string{reason})
+				counts.Decisions++
+				counts.Rejected++
+				counts.RejectReasons[reason]++
+				admissionFor(counts.Admission, candidate.Venue).PortfolioBlocked++
+				counts.ApprovedBlocked = append(counts.ApprovedBlocked, CandidateOutcome{Candidate: candidate, Status: "portfolio_blocked", Reason: reason})
+				continue
+			}
+			decision, position, err := e.EvaluateCandidate(candidate, snapshot, false)
 			if err != nil {
 				return counts, err
 			}
 			counts.Decisions++
 			if decision.Allowed {
 				counts.Approved++
+				admissionFor(counts.Admission, candidate.Venue).Approved++
+				if position == nil {
+					counts.ApprovedBlocked = append(counts.ApprovedBlocked, CandidateOutcome{
+						Candidate: candidate,
+						Status:    "approved_not_entered",
+						Reason:    "no_fill",
+					})
+				}
 				syntheticOpened = true
 			} else {
 				counts.Rejected++
+				classification := classifyRejectReasons(decision.Reasons)
+				switch classification {
+				case "state":
+					admissionFor(counts.Admission, candidate.Venue).StateBlocked++
+				case "portfolio":
+					admissionFor(counts.Admission, candidate.Venue).PortfolioBlocked++
+				default:
+					admissionFor(counts.Admission, candidate.Venue).RiskRejected++
+				}
+				for _, reason := range decision.Reasons {
+					counts.RejectReasons[reason]++
+				}
 			}
 		}
 	}
 	return counts, nil
+}
+
+func (e *Engine) dedupeCandidates(candidates []Candidate) ([]Candidate, []Candidate) {
+	if e.Config.AllowStrategyStacking {
+		return candidates, nil
+	}
+	bestByKey := map[string]Candidate{}
+	for _, candidate := range candidates {
+		key := candidateRouteKey(candidate)
+		if current, ok := bestByKey[key]; !ok || candidateBetter(candidate, current) {
+			bestByKey[key] = candidate
+		}
+	}
+	kept := make([]Candidate, 0, len(bestByKey))
+	deduped := make([]Candidate, 0, len(candidates)-len(bestByKey))
+	for _, candidate := range candidates {
+		best := bestByKey[candidateRouteKey(candidate)]
+		if sameCandidateSelection(candidate, best) {
+			kept = append(kept, candidate)
+			delete(bestByKey, candidateRouteKey(candidate))
+			continue
+		}
+		deduped = append(deduped, candidate)
+	}
+	return kept, deduped
+}
+
+func candidateBetter(candidate Candidate, current Candidate) bool {
+	if candidate.Score != current.Score {
+		return candidate.Score > current.Score
+	}
+	if candidate.Confidence != current.Confidence {
+		return candidate.Confidence > current.Confidence
+	}
+	return candidate.Strategy < current.Strategy
+}
+
+func sameCandidateSelection(a Candidate, b Candidate) bool {
+	return strings.EqualFold(a.Venue, b.Venue) &&
+		strings.EqualFold(a.Symbol, b.Symbol) &&
+		normalizeSide(a.Side) == normalizeSide(b.Side) &&
+		a.Strategy == b.Strategy &&
+		a.Score == b.Score &&
+		a.Confidence == b.Confidence
+}
+
+func candidateRouteKey(candidate Candidate) string {
+	return venueSymbolKey(candidate.Venue, candidate.Symbol) + ":" + normalizeSide(candidate.Side)
+}
+
+func (e *Engine) positionPolicyBlockReason(candidate Candidate) string {
+	if e.Config.AllowStrategyStacking {
+		return ""
+	}
+	limit := e.Config.MaxPositionsPerSymbolVenue
+	if limit <= 0 {
+		limit = 1
+	}
+	count := 0
+	for _, position := range e.State.OpenPositions {
+		if strings.EqualFold(position.Venue, candidate.Venue) &&
+			strings.EqualFold(position.Symbol, candidate.Symbol) &&
+			normalizeSide(position.Side) == normalizeSide(candidate.Side) {
+			count++
+		}
+	}
+	if count >= limit {
+		return "position_policy_duplicate"
+	}
+	return ""
+}
+
+func admissionFor(rows map[string]*CandidateAdmissionSummary, venue string) *CandidateAdmissionSummary {
+	venue = strings.ToLower(strings.TrimSpace(venue))
+	if venue == "" {
+		venue = "unknown"
+	}
+	if rows[venue] == nil {
+		rows[venue] = &CandidateAdmissionSummary{Venue: venue}
+	}
+	return rows[venue]
+}
+
+func admissionSummaryRows(rows map[string]*CandidateAdmissionSummary) []CandidateAdmissionSummary {
+	venues := make([]string, 0, len(rows))
+	for venue := range rows {
+		venues = append(venues, venue)
+	}
+	sort.Strings(venues)
+	out := make([]CandidateAdmissionSummary, 0, len(venues))
+	for _, venue := range venues {
+		out = append(out, *rows[venue])
+	}
+	return out
+}
+
+func classifyRejectReasons(reasons []string) string {
+	for _, reason := range reasons {
+		switch reason {
+		case "max_open_positions", "position_policy_duplicate":
+			return "portfolio"
+		case "max_trades_per_symbol_per_day", "trade_budget_exceeded", "symbol_cooldown", "symbol_lock", "loss_cooldown":
+			return "state"
+		}
+	}
+	return "risk"
+}
+
+func (e *Engine) recordScannerCycleSummary(summary RuntimeSummary) error {
+	return AppendEvent(e.Config, TelemetryEvent{
+		Timestamp: e.Now().UTC().UnixMilli(),
+		Type:      "SCANNER_CYCLE_SUMMARY",
+		Decision:  "system",
+		Reasons: []string{
+			fmt.Sprintf("universeMode=%s", summary.UniverseMode),
+			fmt.Sprintf("selectedSymbols=%d", summary.SelectedSymbols),
+			fmt.Sprintf("venues=%d", summary.Venues),
+			fmt.Sprintf("decisions=%d", summary.Decisions),
+			fmt.Sprintf("approved=%d", summary.Approved),
+			fmt.Sprintf("rejected=%d", summary.Rejected),
+			fmt.Sprintf("openPositions=%d", summary.OpenCount),
+		},
+	})
 }
 
 func (e *Engine) syntheticCandidate(snapshot orderbook.OrderBookSnapshot, syntheticAlreadyOpened bool) (Candidate, bool) {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 func LoadState(cfg Config) (EngineState, error) {
@@ -52,7 +53,7 @@ func EnsureDataFiles(cfg Config) error {
 		return err
 	}
 	headers := map[string][]string{
-		cfg.TradesPath:  {"timestamp", "position_id", "symbol", "side", "entry_price", "exit_price", "qty", "realized_pnl", "reason"},
+		cfg.TradesPath:  {"timestamp", "position_id", "venue", "symbol", "side", "entry_price", "exit_price", "qty", "realized_pnl", "reason"},
 		cfg.EquityPath:  {"timestamp", "balance", "equity", "open_pnl", "realized_today"},
 		cfg.FundingPath: {"timestamp", "position_id", "symbol", "side", "rate", "amount"},
 	}
@@ -89,10 +90,57 @@ func EnsureDataFiles(cfg Config) error {
 	return nil
 }
 
+type RuntimeSummarySnapshot struct {
+	Timestamp       int64            `json:"timestamp"`
+	TimeUTC         string           `json:"timeUtc"`
+	Mode            string           `json:"mode"`
+	ExecutionMode   string           `json:"executionMode"`
+	LiveEnabled     bool             `json:"liveEnabled"`
+	Summary         RuntimeSummary   `json:"summary"`
+	OpenPositions   []PaperPosition  `json:"openPositions"`
+	RecentClosed    []PaperPosition  `json:"recentClosed"`
+	RecentDecisions []TelemetryEvent `json:"recentDecisions"`
+}
+
+func WriteRuntimeSummaryJSON(cfg Config, summary RuntimeSummary, state EngineState) error {
+	now := time.Now().UTC()
+	snapshot := RuntimeSummarySnapshot{
+		Timestamp:       now.UnixMilli(),
+		TimeUTC:         now.Format(time.RFC3339),
+		Mode:            summary.Mode,
+		ExecutionMode:   summary.ExecutionMode,
+		LiveEnabled:     summary.LiveEnabled,
+		Summary:         summary,
+		OpenPositions:   append([]PaperPosition(nil), state.OpenPositions...),
+		RecentClosed:    append([]PaperPosition(nil), state.RecentClosed...),
+		RecentDecisions: append([]TelemetryEvent(nil), state.RecentDecisions...),
+	}
+	return writeJSONFile(cfg.SummaryJSONPath, snapshot)
+}
+
+func WriteRejectSummaryJSON(cfg Config, reasons map[string]int) error {
+	if reasons == nil {
+		reasons = map[string]int{}
+	}
+	return writeJSONFile(cfg.RejectSummaryJSONPath, reasons)
+}
+
+func writeJSONFile(path string, value any) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	body, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(body, '\n'), 0o644)
+}
+
 func AppendTrade(cfg Config, timestamp int64, position PaperPosition, exitPrice float64, qty float64, pnl float64, reason string) error {
 	return appendCSVRow(cfg.TradesPath, []string{
 		strconv.FormatInt(timestamp, 10),
 		position.ID,
+		position.Venue,
 		position.Symbol,
 		position.Side,
 		floatString(position.EntryPrice),
