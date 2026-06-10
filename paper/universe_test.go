@@ -36,11 +36,11 @@ func TestBuildManualUniverse(t *testing.T) {
 	}
 }
 
-func TestVolumeFilterUniverseSortsAndCaps(t *testing.T) {
+func TestVolumeFilterUniverseBalancesVenuesAndCaps(t *testing.T) {
 	cfg := tempConfig(t)
 	cfg.UniverseMode = "dynamic"
 	cfg.Min24hVolumeUSD = 5000000
-	cfg.MaxSymbols = 2
+	cfg.MaxSymbols = 3
 	cfg.Venues = []string{"aster", "hyperliquid", "lighter"}
 
 	providers := map[string]UniverseProvider{
@@ -66,11 +66,14 @@ func TestVolumeFilterUniverseSortsAndCaps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("select volume-filter universe: %v", err)
 	}
-	if len(selection.Selected) != 2 {
-		t.Fatalf("expected 2 capped rows, got %d", len(selection.Selected))
+	if len(selection.Selected) != 3 {
+		t.Fatalf("expected 3 capped rows, got %d", len(selection.Selected))
 	}
-	if selection.Selected[0].Venue != "hyperliquid" || selection.Selected[1].Venue != "aster" {
-		t.Fatalf("unexpected sort order: %+v", selection.Selected)
+	seenVenues := countUniverseByVenue(selection.Selected)
+	for _, venue := range []string{"aster", "hyperliquid", "lighter"} {
+		if seenVenues[venue] != 1 {
+			t.Fatalf("expected venue-balanced selection, got %+v", selection.Selected)
+		}
 	}
 	if len(selection.Discovered) != 4 || len(selection.Qualified) != 3 {
 		t.Fatalf("unexpected discovered/qualified counts: %+v", selection)
@@ -86,7 +89,7 @@ func TestVolumeFilterUniverseSortsAndCaps(t *testing.T) {
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		t.Fatalf("decode universe json: %v", err)
 	}
-	if decoded.Mode != "dynamic" || len(decoded.Selected) != 2 {
+	if decoded.Mode != "dynamic" || len(decoded.Selected) != 3 {
 		t.Fatalf("unexpected universe json: %+v", decoded)
 	}
 	for _, path := range []string{cfg.DiscoveredUniversePath, cfg.QualifiedUniversePath, cfg.SelectedUniversePath} {
@@ -97,6 +100,78 @@ func TestVolumeFilterUniverseSortsAndCaps(t *testing.T) {
 		if len(body) == 0 {
 			t.Fatalf("expected universe export content in %s", path)
 		}
+	}
+}
+
+func TestDynamicUniverseDoesNotLeakManualMajorDefaults(t *testing.T) {
+	cfg := tempConfig(t)
+	cfg.UniverseMode = "dynamic"
+	cfg.Symbols = []string{"BTC", "ETH", "SOL"}
+	cfg.Min24hVolumeUSD = 1
+	cfg.MaxSymbols = 10
+	cfg.Venues = []string{"hyperliquid"}
+	selection, err := selectUniverseWithProviders(cfg, map[string]UniverseProvider{
+		"hyperliquid": func() ([]UniverseEntry, error) {
+			return []UniverseEntry{
+				{Venue: "hyperliquid", Symbol: "DOGE", CanonicalSymbol: "DOGE", Active: true, Tradable: true, Volume24hUSD: 9000000},
+				{Venue: "hyperliquid", Symbol: "ARB", CanonicalSymbol: "ARB", Active: true, Tradable: true, Volume24hUSD: 8000000},
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("select dynamic universe: %v", err)
+	}
+	if selection.ManualSymbols {
+		t.Fatalf("dynamic mode must not be marked manual: %+v", selection)
+	}
+	if len(selection.Selected) != 2 || selection.Selected[0].CanonicalSymbol == "BTC" || selection.Selected[0].CanonicalSymbol == "ETH" {
+		t.Fatalf("manual major defaults leaked into dynamic selection: %+v", selection.Selected)
+	}
+}
+
+func TestDynamicUniverseKeepsQualifiedNonMajorsWhenVenueBalanced(t *testing.T) {
+	cfg := tempConfig(t)
+	cfg.UniverseMode = "dynamic"
+	cfg.Min24hVolumeUSD = 1
+	cfg.MaxSymbols = 4
+	cfg.Venues = []string{"aster", "hyperliquid"}
+	selection, err := selectUniverseWithProviders(cfg, map[string]UniverseProvider{
+		"aster": func() ([]UniverseEntry, error) {
+			return []UniverseEntry{
+				{Venue: "aster", Symbol: "BTCUSDT", CanonicalSymbol: "BTC", Active: true, Tradable: true, Volume24hUSD: 100000000},
+				{Venue: "aster", Symbol: "ETHUSDT", CanonicalSymbol: "ETH", Active: true, Tradable: true, Volume24hUSD: 90000000},
+				{Venue: "aster", Symbol: "DOGEUSDT", CanonicalSymbol: "DOGE", Active: true, Tradable: true, Volume24hUSD: 80000000},
+			}, nil
+		},
+		"hyperliquid": func() ([]UniverseEntry, error) {
+			return []UniverseEntry{
+				{Venue: "hyperliquid", Symbol: "BTC", CanonicalSymbol: "BTC", Active: true, Tradable: true, Volume24hUSD: 70000000},
+				{Venue: "hyperliquid", Symbol: "ARB", CanonicalSymbol: "ARB", Active: true, Tradable: true, Volume24hUSD: 60000000},
+				{Venue: "hyperliquid", Symbol: "OP", CanonicalSymbol: "OP", Active: true, Tradable: true, Volume24hUSD: 50000000},
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("select dynamic universe: %v", err)
+	}
+	nonMajors := 0
+	for _, row := range selection.Selected {
+		if !isMajorCanonical(row.CanonicalSymbol) {
+			nonMajors++
+		}
+	}
+	if nonMajors == 0 {
+		t.Fatalf("expected at least one qualified non-major in selection, got %+v", selection.Selected)
+	}
+	if len(selection.QualifiedSkipped) == 0 {
+		t.Fatalf("expected qualified-but-not-selected diagnostics")
+	}
+	body, err := os.ReadFile(cfg.QualifiedNotSelectedPath)
+	if err != nil {
+		t.Fatalf("read qualified skipped export: %v", err)
+	}
+	if !strings.Contains(string(body), "qualified_but_below_selection_cutoff") {
+		t.Fatalf("expected skip reason export, got %s", string(body))
 	}
 }
 
@@ -164,6 +239,7 @@ func TestDynamicUniverseDiagnosticsExplainZeroQualified(t *testing.T) {
 	cfg := tempConfig(t)
 	cfg.UniverseMode = "dynamic"
 	cfg.Min24hVolumeUSD = 1000
+	cfg.RequireVolumeForQualification = true
 	cfg.Venues = []string{"hyperliquid"}
 
 	selection, err := selectUniverseWithProviders(cfg, map[string]UniverseProvider{
@@ -190,6 +266,37 @@ func TestDynamicUniverseDiagnosticsExplainZeroQualified(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "missing_volume") || !strings.Contains(string(body), "low_volume") {
 		t.Fatalf("expected persisted diagnostics reasons, got %s", string(body))
+	}
+}
+
+func TestDynamicUniverseAdmitsUnknownVolumeWhenNotStrict(t *testing.T) {
+	cfg := tempConfig(t)
+	cfg.UniverseMode = "dynamic"
+	cfg.Min24hVolumeUSD = 5000000
+	cfg.RequireVolumeForQualification = false
+	cfg.MaxSymbols = 3
+	cfg.Venues = []string{"hyperliquid", "lighter"}
+
+	selection, err := selectUniverseWithProviders(cfg, map[string]UniverseProvider{
+		"hyperliquid": func() ([]UniverseEntry, error) {
+			return []UniverseEntry{
+				{Venue: "hyperliquid", Symbol: "ARB", CanonicalSymbol: "ARB", Active: true, Tradable: true, LastPrice: 1.23},
+			}, nil
+		},
+		"lighter": func() ([]UniverseEntry, error) {
+			return []UniverseEntry{
+				{Venue: "lighter", Symbol: "TIA", CanonicalSymbol: "TIA", Active: true, Tradable: true, LastPrice: 4.56},
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("select dynamic universe: %v", err)
+	}
+	if len(selection.Qualified) != 2 || len(selection.Selected) != 2 {
+		t.Fatalf("expected unknown-volume active markets to qualify by default, got %+v", selection)
+	}
+	if selection.Diagnostics[0].AdmittedUnknownVolume == 0 && selection.Diagnostics[1].AdmittedUnknownVolume == 0 {
+		t.Fatalf("expected admitted unknown-volume diagnostics, got %+v", selection.Diagnostics)
 	}
 }
 
@@ -257,5 +364,8 @@ func TestDefaultConfigUniversePathsUsePaperRoot(t *testing.T) {
 	}
 	if cfg.DiscoveredUniversePath != filepath.Join("C:", "tmp", "algo-data", "paper", "discovered_universe.json") {
 		t.Fatalf("unexpected discovered universe path: %s", cfg.DiscoveredUniversePath)
+	}
+	if cfg.QualifiedNotSelectedPath != filepath.Join("C:", "tmp", "algo-data", "paper", "qualified_not_selected.json") {
+		t.Fatalf("unexpected qualified-not-selected path: %s", cfg.QualifiedNotSelectedPath)
 	}
 }

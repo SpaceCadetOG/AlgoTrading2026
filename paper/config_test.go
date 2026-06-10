@@ -29,4 +29,10 @@ func TestDefaultConfigUsesDataRoot(t *testing.T) {
 	if cfg.FundingPath != filepath.Join(root, "funding.csv") {
 		t.Fatalf("unexpected funding path: %s", cfg.FundingPath)
 	}
+	if cfg.RankingPath != filepath.Join(root, "ranking.json") {
+		t.Fatalf("unexpected ranking path: %s", cfg.RankingPath)
+	}
+	if cfg.RankingDiagnosticsPath != filepath.Join(root, "ranking_diagnostics.json") {
+		t.Fatalf("unexpected ranking diagnostics path: %s", cfg.RankingDiagnosticsPath)
+	}
 }

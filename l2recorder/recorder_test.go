@@ -2,6 +2,7 @@ package l2recorder
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -19,7 +20,7 @@ func TestDefaultRecorderConfig(t *testing.T) {
 	if cfg.IntervalSeconds != 5 || cfg.MaxSnapshots != 12 {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
-	if cfg.OutputPath != "data/l2_snapshots/l2_snapshots.csv" {
+	if cfg.OutputPath != filepath.Join(".", "data", "l2", "l2_snapshots.csv") {
 		t.Fatalf("output=%s", cfg.OutputPath)
 	}
 }

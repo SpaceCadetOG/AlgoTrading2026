@@ -22,6 +22,23 @@ type HyperliquidRawTrade struct {
 	TID  any    `json:"tid"`
 }
 
+type UserFill struct {
+	ClosedPnl     string `json:"closedPnl"`
+	Coin          string `json:"coin"`
+	Crossed       bool   `json:"crossed"`
+	Dir           string `json:"dir"`
+	Hash          string `json:"hash"`
+	Oid           int64  `json:"oid"`
+	Price         string `json:"px"`
+	Side          string `json:"side"`
+	StartPosition string `json:"startPosition"`
+	Size          string `json:"sz"`
+	Time          int64  `json:"time"`
+	Fee           string `json:"fee"`
+	FeeToken      string `json:"feeToken"`
+	Tid           int64  `json:"tid"`
+}
+
 func parseTradeFloat(value string) (float64, error) {
 	return strconv.ParseFloat(strings.TrimSpace(value), 64)
 }
@@ -37,6 +54,15 @@ func firstNonEmpty(values ...string) string {
 
 func GetRecentTrades(symbol string) ([]tradetape.TradeTapePrint, error) {
 	return getRecentTradesAt(getBaseURL(), symbol)
+}
+
+func (c *Client) GetUserFills() ([]UserFill, error) {
+	var result []UserFill
+	jsonBody := fmt.Sprintf(`{"type":"userFills","user":"%s"}`, c.Address)
+	if err := postInfoJSON(jsonBody, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func getRecentTradesAt(baseURL string, symbol string) ([]tradetape.TradeTapePrint, error) {

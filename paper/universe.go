@@ -27,22 +27,26 @@ type UniverseEntry struct {
 	Active          bool    `json:"active"`
 	Tradable        bool    `json:"tradable"`
 	Volume24hUSD    float64 `json:"volume24hUsd"`
+	VolumeKnown     bool    `json:"volumeKnown"`
 	LastPrice       float64 `json:"lastPrice,omitempty"`
 	SpreadPct       float64 `json:"spreadPct,omitempty"`
 	Rank            int     `json:"rank"`
 }
 
 type UniverseSelection struct {
-	Mode            string                     `json:"mode"`
-	ManualSymbols   bool                       `json:"manualSymbols"`
-	Min24hVolumeUSD float64                    `json:"min24hVolumeUsd"`
-	MaxSymbols      int                        `json:"maxSymbols"`
-	Discovered      []UniverseEntry            `json:"discovered"`
-	Qualified       []UniverseEntry            `json:"qualified"`
-	Selected        []UniverseEntry            `json:"selected"`
-	Stats           []VenueDiscoveryStats      `json:"stats"`
-	Diagnostics     []QualificationDiagnostics `json:"diagnostics,omitempty"`
-	Notes           []string                   `json:"notes,omitempty"`
+	Mode             string                     `json:"mode"`
+	ManualSymbols    bool                       `json:"manualSymbols"`
+	Min24hVolumeUSD  float64                    `json:"min24hVolumeUsd"`
+	RequireVolume    bool                       `json:"requireVolume"`
+	MaxSymbols       int                        `json:"maxSymbols"`
+	Discovered       []UniverseEntry            `json:"discovered"`
+	Qualified        []UniverseEntry            `json:"qualified"`
+	Selected         []UniverseEntry            `json:"selected"`
+	QualifiedSkipped []QualifiedNotSelected     `json:"qualifiedSkipped,omitempty"`
+	Stats            []VenueDiscoveryStats      `json:"stats"`
+	Diagnostics      []QualificationDiagnostics `json:"diagnostics,omitempty"`
+	BiasDiagnostics  UniverseBiasDiagnostics    `json:"biasDiagnostics,omitempty"`
+	Notes            []string                   `json:"notes,omitempty"`
 }
 
 type VenueDiscoveryStats struct {
@@ -55,6 +59,30 @@ type VenueDiscoveryStats struct {
 }
 
 type UniverseProvider func() ([]UniverseEntry, error)
+
+type QualifiedNotSelected struct {
+	Venue           string  `json:"venue"`
+	Symbol          string  `json:"symbol"`
+	CanonicalSymbol string  `json:"canonicalSymbol"`
+	Rank            int     `json:"rank"`
+	Volume24hUSD    float64 `json:"volume24hUsd"`
+	Reason          string  `json:"reason"`
+}
+
+type UniverseBiasDiagnostics struct {
+	ManualSymbols              bool                       `json:"manualSymbols"`
+	DiscoveredByVenue          map[string]int             `json:"discoveredByVenue"`
+	QualifiedByVenue           map[string]int             `json:"qualifiedByVenue"`
+	SelectedByVenue            map[string]int             `json:"selectedByVenue"`
+	SelectedMajors             int                        `json:"selectedMajors"`
+	SelectedNonMajors          int                        `json:"selectedNonMajors"`
+	QualifiedMajors            int                        `json:"qualifiedMajors"`
+	QualifiedNonMajors         int                        `json:"qualifiedNonMajors"`
+	MajorSelectedPct           float64                    `json:"majorSelectedPct"`
+	TopQualifiedNotSelected    []QualifiedNotSelected     `json:"topQualifiedNotSelected"`
+	QualificationRejectReasons []QualificationDiagnostics `json:"qualificationRejectReasons,omitempty"`
+	Policy                     string                     `json:"policy"`
+}
 
 type QualificationDiagnostics struct {
 	Venue                      string         `json:"venue"`
@@ -71,6 +99,7 @@ type QualificationDiagnostics struct {
 	UnsupportedMetadata        int            `json:"unsupportedMetadata"`
 	Inactive                   int            `json:"inactive"`
 	Untradable                 int            `json:"untradable"`
+	AdmittedUnknownVolume      int            `json:"admittedUnknownVolume"`
 }
 
 func SelectUniverse(cfg Config) (UniverseSelection, error) {
@@ -85,6 +114,7 @@ func selectUniverseWithProviders(cfg Config, providers map[string]UniverseProvid
 	selection := UniverseSelection{
 		Mode:            mode,
 		Min24hVolumeUSD: cfg.Min24hVolumeUSD,
+		RequireVolume:   cfg.RequireVolumeForQualification,
 		MaxSymbols:      cfg.MaxSymbols,
 	}
 	switch mode {
@@ -139,6 +169,8 @@ func selectUniverseWithProviders(cfg Config, providers map[string]UniverseProvid
 						diagnostics.MissingSymbolNormalization++
 					case "unsupported_metadata":
 						diagnostics.UnsupportedMetadata++
+					case "admitted_unknown_volume":
+						diagnostics.AdmittedUnknownVolume++
 					}
 				}
 				if qualified {
@@ -151,11 +183,8 @@ func selectUniverseWithProviders(cfg Config, providers map[string]UniverseProvid
 			selection.Diagnostics = append(selection.Diagnostics, diagnostics)
 			selection.Stats = append(selection.Stats, stat)
 		}
-		selection.Selected = append([]UniverseEntry(nil), selection.Qualified...)
-		sortUniverseEntries(selection.Selected)
-		if cfg.MaxSymbols > 0 && len(selection.Selected) > cfg.MaxSymbols {
-			selection.Selected = selection.Selected[:cfg.MaxSymbols]
-		}
+		selection.Selected = selectDynamicUniverse(selection.Qualified, cfg)
+		selection.QualifiedSkipped = qualifiedNotSelected(selection.Qualified, selection.Selected)
 		selectedByVenue := countUniverseByVenue(selection.Selected)
 		for i := range selection.Stats {
 			selection.Stats[i].Selected = selectedByVenue[selection.Stats[i].Venue]
@@ -169,6 +198,7 @@ func selectUniverseWithProviders(cfg Config, providers map[string]UniverseProvid
 	if len(selection.Stats) == 0 {
 		selection.Stats = statsFromManualSelection(selection.Selected)
 	}
+	selection.BiasDiagnostics = buildUniverseBiasDiagnostics(selection)
 	if err := writeUniverseCSV(cfg.UniverseCSVPath, selection.Selected); err != nil {
 		return UniverseSelection{}, err
 	}
@@ -185,6 +215,12 @@ func selectUniverseWithProviders(cfg Config, providers map[string]UniverseProvid
 		return UniverseSelection{}, err
 	}
 	if err := writeQualificationDiagnosticsJSON(cfg.QualificationDiagnosticsPath, selection.Diagnostics); err != nil {
+		return UniverseSelection{}, err
+	}
+	if err := writeQualifiedNotSelectedJSON(cfg.QualifiedNotSelectedPath, selection.QualifiedSkipped); err != nil {
+		return UniverseSelection{}, err
+	}
+	if err := writeUniverseBiasDiagnosticsJSON(cfg.UniverseBiasDiagnosticsPath, selection.BiasDiagnostics); err != nil {
 		return UniverseSelection{}, err
 	}
 	return selection, nil
@@ -208,7 +244,11 @@ func qualifyUniverseEntry(row UniverseEntry, cfg Config) (bool, []string) {
 	}
 	if cfg.Min24hVolumeUSD > 0 {
 		if row.Volume24hUSD <= 0 {
-			reasons = append(reasons, "missing_volume")
+			if cfg.RequireVolumeForQualification {
+				reasons = append(reasons, "missing_volume")
+			} else {
+				reasons = append(reasons, "admitted_unknown_volume")
+			}
 		} else if row.Volume24hUSD < cfg.Min24hVolumeUSD {
 			reasons = append(reasons, "low_volume")
 		}
@@ -219,11 +259,26 @@ func qualifyUniverseEntry(row UniverseEntry, cfg Config) (bool, []string) {
 	if row.SpreadPct > 0.5 {
 		reasons = append(reasons, "spread_too_wide")
 	}
-	return len(reasons) == 0, reasons
+	return !hasBlockingQualificationReason(reasons), reasons
+}
+
+func hasBlockingQualificationReason(reasons []string) bool {
+	for _, reason := range reasons {
+		if reason != "admitted_unknown_volume" {
+			return true
+		}
+	}
+	return false
 }
 
 func sortUniverseEntries(rows []UniverseEntry) {
 	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Volume24hUSD <= 0 && rows[j].Volume24hUSD > 0 {
+			return false
+		}
+		if rows[i].Volume24hUSD > 0 && rows[j].Volume24hUSD <= 0 {
+			return true
+		}
 		if rows[i].Volume24hUSD == rows[j].Volume24hUSD {
 			if rows[i].Venue == rows[j].Venue {
 				return rows[i].Symbol < rows[j].Symbol
@@ -232,6 +287,154 @@ func sortUniverseEntries(rows []UniverseEntry) {
 		}
 		return rows[i].Volume24hUSD > rows[j].Volume24hUSD
 	})
+}
+
+func selectDynamicUniverse(qualified []UniverseEntry, cfg Config) []UniverseEntry {
+	rows := append([]UniverseEntry(nil), qualified...)
+	sortUniverseEntries(rows)
+	if cfg.MaxSymbols <= 0 || len(rows) <= cfg.MaxSymbols {
+		return rows
+	}
+	venues := sortedUniverseVenues(rows)
+	quota := cfg.MaxSymbols / len(venues)
+	if quota < 1 {
+		quota = 1
+	}
+	selected := make([]UniverseEntry, 0, cfg.MaxSymbols)
+	selectedKeys := map[string]bool{}
+	byVenue := universeByVenue(rows)
+	for _, venue := range venues {
+		venueRows := byVenue[venue]
+		limit := quota
+		if limit > len(venueRows) {
+			limit = len(venueRows)
+		}
+		for i := 0; i < limit && len(selected) < cfg.MaxSymbols; i++ {
+			addUniverseSelection(&selected, selectedKeys, venueRows[i])
+		}
+	}
+	for _, row := range rows {
+		if len(selected) >= cfg.MaxSymbols {
+			break
+		}
+		addUniverseSelection(&selected, selectedKeys, row)
+	}
+	sortUniverseEntries(selected)
+	return selected
+}
+
+func addUniverseSelection(selected *[]UniverseEntry, selectedKeys map[string]bool, row UniverseEntry) {
+	key := universeRouteKey(row)
+	if selectedKeys[key] {
+		return
+	}
+	selectedKeys[key] = true
+	*selected = append(*selected, row)
+}
+
+func qualifiedNotSelected(qualified []UniverseEntry, selected []UniverseEntry) []QualifiedNotSelected {
+	selectedKeys := map[string]bool{}
+	for _, row := range selected {
+		selectedKeys[universeRouteKey(row)] = true
+	}
+	rows := append([]UniverseEntry(nil), qualified...)
+	sortUniverseEntries(rows)
+	out := make([]QualifiedNotSelected, 0)
+	for _, row := range rows {
+		if selectedKeys[universeRouteKey(row)] {
+			continue
+		}
+		out = append(out, QualifiedNotSelected{
+			Venue:           row.Venue,
+			Symbol:          row.Symbol,
+			CanonicalSymbol: row.CanonicalSymbol,
+			Rank:            row.Rank,
+			Volume24hUSD:    row.Volume24hUSD,
+			Reason:          "qualified_but_below_selection_cutoff",
+		})
+	}
+	return out
+}
+
+func buildUniverseBiasDiagnostics(selection UniverseSelection) UniverseBiasDiagnostics {
+	selectedMajors, selectedNonMajors := majorSplit(selection.Selected)
+	qualifiedMajors, qualifiedNonMajors := majorSplit(selection.Qualified)
+	majorPct := 0.0
+	if len(selection.Selected) > 0 {
+		majorPct = float64(selectedMajors) / float64(len(selection.Selected)) * 100
+	}
+	topSkipped := selection.QualifiedSkipped
+	if len(topSkipped) > 25 {
+		topSkipped = append([]QualifiedNotSelected(nil), topSkipped[:25]...)
+	}
+	return UniverseBiasDiagnostics{
+		ManualSymbols:              selection.ManualSymbols,
+		DiscoveredByVenue:          countUniverseByVenue(selection.Discovered),
+		QualifiedByVenue:           countUniverseByVenue(selection.Qualified),
+		SelectedByVenue:            countUniverseByVenue(selection.Selected),
+		SelectedMajors:             selectedMajors,
+		SelectedNonMajors:          selectedNonMajors,
+		QualifiedMajors:            qualifiedMajors,
+		QualifiedNonMajors:         qualifiedNonMajors,
+		MajorSelectedPct:           majorPct,
+		TopQualifiedNotSelected:    topSkipped,
+		QualificationRejectReasons: selection.Diagnostics,
+		Policy:                     "venue_balanced_quota_then_global_volume_fill",
+	}
+}
+
+func majorSplit(rows []UniverseEntry) (int, int) {
+	majors := 0
+	nonMajors := 0
+	for _, row := range rows {
+		if isMajorCanonical(row.CanonicalSymbol) {
+			majors++
+		} else {
+			nonMajors++
+		}
+	}
+	return majors, nonMajors
+}
+
+func isMajorCanonical(symbol string) bool {
+	switch strings.ToUpper(strings.TrimSpace(symbol)) {
+	case "BTC", "ETH", "SOL":
+		return true
+	default:
+		return false
+	}
+}
+
+func sortedUniverseVenues(rows []UniverseEntry) []string {
+	seen := map[string]bool{}
+	for _, row := range rows {
+		venue := strings.ToLower(strings.TrimSpace(row.Venue))
+		if venue != "" {
+			seen[venue] = true
+		}
+	}
+	venues := make([]string, 0, len(seen))
+	for venue := range seen {
+		venues = append(venues, venue)
+	}
+	sort.Strings(venues)
+	return venues
+}
+
+func universeByVenue(rows []UniverseEntry) map[string][]UniverseEntry {
+	out := map[string][]UniverseEntry{}
+	for _, row := range rows {
+		venue := strings.ToLower(strings.TrimSpace(row.Venue))
+		out[venue] = append(out[venue], row)
+	}
+	for venue := range out {
+		sortUniverseEntries(out[venue])
+	}
+	return out
+}
+
+func universeRouteKey(row UniverseEntry) string {
+	return strings.ToLower(strings.TrimSpace(row.Venue)) + ":" + strings.ToUpper(strings.TrimSpace(row.Symbol))
 }
 
 func countUniverseByVenue(rows []UniverseEntry) map[string]int {
@@ -357,6 +560,28 @@ func writeQualificationDiagnosticsJSON(path string, diagnostics []QualificationD
 	return os.WriteFile(path, append(body, '\n'), 0o644)
 }
 
+func writeQualifiedNotSelectedJSON(path string, rows []QualifiedNotSelected) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	body, err := json.MarshalIndent(rows, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(body, '\n'), 0o644)
+}
+
+func writeUniverseBiasDiagnosticsJSON(path string, diagnostics UniverseBiasDiagnostics) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	body, err := json.MarshalIndent(diagnostics, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(body, '\n'), 0o644)
+}
+
 func uniqueUniverseVenues(rows []UniverseEntry) int {
 	seen := map[string]bool{}
 	for _, row := range rows {
@@ -430,6 +655,7 @@ func parseAsterUniverse(body []byte) ([]UniverseEntry, error) {
 			Active:          true,
 			Tradable:        true,
 			Volume24hUSD:    parseUniverseFloat(item.QuoteVolume),
+			VolumeKnown:     parseUniverseFloat(item.QuoteVolume) > 0,
 			LastPrice:       parseUniverseFloat(item.LastPrice),
 			SpreadPct:       spreadPctFromBidAsk(parseUniverseFloat(item.BidPrice), parseUniverseFloat(item.AskPrice)),
 		})
@@ -486,15 +712,17 @@ func parseHyperliquidUniverse(body []byte) ([]UniverseEntry, error) {
 	for i := 0; i < limit; i++ {
 		symbol := stringsUpperTrim(meta.Universe[i].Name)
 		identity := symbols.NormalizeSymbol("hyperliquid", symbol)
+		volume := parseUniverseFloat(
+			firstUniverseValue(ctxs[i], "dayNtlVlm", "dailyNtlVlm", "dayNtlVolume", "volume24h"),
+		)
 		rows = append(rows, UniverseEntry{
 			Venue:           "hyperliquid",
 			Symbol:          identity.VenueSymbol,
 			CanonicalSymbol: identity.CanonicalSymbol,
 			Active:          true,
 			Tradable:        true,
-			Volume24hUSD: parseUniverseFloat(
-				firstUniverseValue(ctxs[i], "dayNtlVlm", "dailyNtlVlm", "dayNtlVolume", "volume24h"),
-			),
+			Volume24hUSD:    volume,
+			VolumeKnown:     volume > 0,
 			LastPrice: parseUniverseFloat(
 				firstUniverseValue(ctxs[i], "midPx", "markPx", "oraclePx", "prevDayPx"),
 			),
@@ -608,6 +836,14 @@ func lighterMarketEntryFromMap(m map[string]any) (UniverseEntry, bool) {
 		symbol = strings.Split(symbol, "/")[0]
 	}
 	identity := symbols.NormalizeSymbol("lighter", symbol)
+	volume := parseUniverseFloat(firstUniverseValue(
+		m,
+		"daily_quote_token_volume",
+		"volume24h",
+		"quoteVolume",
+		"dayNtlVlm",
+		"volume",
+	))
 	row := UniverseEntry{
 		Venue:           "lighter",
 		Symbol:          identity.VenueSymbol,
@@ -615,14 +851,8 @@ func lighterMarketEntryFromMap(m map[string]any) (UniverseEntry, bool) {
 		MarketID:        stringFromAny(firstUniverseValue(m, "market_id", "marketIndex", "market_index", "id")),
 		Active:          boolFromAny(firstUniverseValue(m, "active", "enabled", "tradable"), true),
 		Tradable:        boolFromAny(firstUniverseValue(m, "tradable", "active", "enabled"), true),
-		Volume24hUSD: parseUniverseFloat(firstUniverseValue(
-			m,
-			"daily_quote_token_volume",
-			"volume24h",
-			"quoteVolume",
-			"dayNtlVlm",
-			"volume",
-		)),
+		Volume24hUSD:    volume,
+		VolumeKnown:     volume > 0,
 		LastPrice: parseUniverseFloat(firstUniverseValue(
 			m,
 			"mid_price",

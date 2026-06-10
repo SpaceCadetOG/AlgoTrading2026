@@ -1,9 +1,11 @@
 package lighter
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"time"
 
@@ -36,6 +38,8 @@ type LighterTickerMessage struct {
 
 	Timestamp int64 `json:"timestamp"`
 }
+
+type LighterAccountStateHandler func(LighterAccountWSState)
 
 func (c *Client) StreamTicker(
 	symbol string,
@@ -116,6 +120,88 @@ func keepAlive(conn *websocket.Conn) {
 		err := conn.WriteMessage(websocket.PingMessage, []byte("ping"))
 		if err != nil {
 			return
+		}
+	}
+}
+
+func (c *Client) StreamAccountState(ctx context.Context, handler LighterAccountStateHandler) error {
+	cfg, err := LoadExecutionConfig()
+	if err != nil {
+		return err
+	}
+	account := cfg.AccountIndex
+	channels := []string{
+		fmt.Sprintf("account_all_orders/%d", account),
+		fmt.Sprintf("account_all_trades/%d", account),
+		fmt.Sprintf("account_all_positions/%d", account),
+	}
+	backoff := time.Second
+	for {
+		if err := c.streamAccountStateOnce(ctx, channels, handler); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			log.Printf("Lighter account stream disconnected: %v; reconnecting in %s", err, backoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil
+			case <-timer.C:
+			}
+			backoff = time.Duration(math.Min(float64(30*time.Second), float64(backoff*2)))
+			continue
+		}
+		return nil
+	}
+}
+
+func (c *Client) streamAccountStateOnce(ctx context.Context, channels []string, handler LighterAccountStateHandler) error {
+	conn, _, err := websocket.DefaultDialer.Dial(getWSURL(), nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	for _, channel := range channels {
+		subscribeMsg := fmt.Sprintf(`{"type":"subscribe","channel":"%s"}`, channel)
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(subscribeMsg)); err != nil {
+			return err
+		}
+	}
+	go keepAlive(conn)
+	errCh := make(chan error, 1)
+	go func() {
+		<-ctx.Done()
+		errCh <- conn.Close()
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-errCh:
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		default:
+		}
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		state, err := ParseAccountWSState(msg)
+		if err != nil {
+			log.Printf("Lighter account stream decode error: %v raw=%s", err, string(msg))
+			continue
+		}
+		if len(state.Orders) == 0 && len(state.Trades) == 0 && len(state.Positions) == 0 {
+			continue
+		}
+		if handler != nil {
+			handler(state)
 		}
 	}
 }

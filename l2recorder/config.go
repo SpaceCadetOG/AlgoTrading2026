@@ -1,5 +1,7 @@
 package l2recorder
 
+import appconfig "AlgoTrading2026/config"
+
 type RecorderConfig struct {
 	Symbols         []string
 	Venues          []string
@@ -14,7 +16,7 @@ func DefaultRecorderConfig() RecorderConfig {
 		Venues:          []string{"hyperliquid", "aster", "lighter"},
 		IntervalSeconds: 5,
 		MaxSnapshots:    12,
-		OutputPath:      "data/l2_snapshots/l2_snapshots.csv",
+		OutputPath:      appconfig.DataPath("l2", "l2_snapshots.csv"),
 	}
 }
 

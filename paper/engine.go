@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,7 @@ type Engine struct {
 	Now              func() time.Time
 	SelectUniverse   func(cfg Config) (UniverseSelection, error)
 	FetchOrderBook   func(venue string, symbol string) (orderbook.OrderBookSnapshot, error)
+	FetchMarketBook  func(venue string, symbol string, marketID int) (orderbook.OrderBookSnapshot, error)
 	RunTradeRecorder func() error
 	RunL2Recorder    func() error
 	BuildCandidates  runtime.CandidateBuilder
@@ -42,11 +44,14 @@ type RuntimeSummary struct {
 	SelectedSymbols          int
 	Venues                   int
 	SelectedUniverse         []UniverseEntry
+	QualifiedSkipped         []QualifiedNotSelected
+	UniverseBiasDiagnostics  UniverseBiasDiagnostics
 	DiscoveryStats           []VenueDiscoveryStats
 	QualificationDiagnostics []QualificationDiagnostics
 	RejectReasons            map[string]int
 	ApprovedBlocked          []CandidateOutcome
 	CandidateAdmission       []CandidateAdmissionSummary
+	CandidateCoverage        []CandidateCoverageRow
 	StateBlockers            StateBlockers
 	Mode                     string
 	ExecutionMode            string
@@ -79,6 +84,47 @@ type CandidateAdmissionSummary struct {
 	StateBlocked     int    `json:"stateBlocked"`
 }
 
+type CandidateCoverageRow struct {
+	Venue             string         `json:"venue"`
+	Symbol            string         `json:"symbol"`
+	CanonicalSymbol   string         `json:"canonicalSymbol"`
+	Major             bool           `json:"major"`
+	SnapshotFetched   bool           `json:"snapshotFetched"`
+	Candidates        int            `json:"candidates"`
+	Approved          int            `json:"approved"`
+	Rejected          int            `json:"rejected"`
+	ConfidenceSum     float64        `json:"confidenceSum,omitempty"`
+	AverageConfidence float64        `json:"averageConfidence,omitempty"`
+	RejectReasons     map[string]int `json:"rejectReasons,omitempty"`
+}
+
+type CandidateQualitySummary struct {
+	Symbols                   int            `json:"symbols"`
+	MajorSymbols              int            `json:"majorSymbols"`
+	NonMajorSymbols           int            `json:"nonMajorSymbols"`
+	Candidates                int            `json:"candidates"`
+	Approved                  int            `json:"approved"`
+	Rejected                  int            `json:"rejected"`
+	NonMajorCandidates        int            `json:"nonMajorCandidates"`
+	NonMajorApproved          int            `json:"nonMajorApproved"`
+	AverageConfidence         float64        `json:"averageConfidence,omitempty"`
+	NonMajorAverageConfidence float64        `json:"nonMajorAverageConfidence,omitempty"`
+	QualifiedToCandidatePct   float64        `json:"qualifiedToCandidatePct"`
+	CandidateToApprovedPct    float64        `json:"candidateToApprovedPct"`
+	TopNonMajorRejects        map[string]int `json:"topNonMajorRejects,omitempty"`
+}
+
+type CandidateQualityGroup struct {
+	Key               string         `json:"key"`
+	Candidates        int            `json:"candidates"`
+	Approved          int            `json:"approved"`
+	Rejected          int            `json:"rejected"`
+	AverageConfidence float64        `json:"averageConfidence,omitempty"`
+	ConfidenceSum     float64        `json:"confidenceSum,omitempty"`
+	RejectRate        float64        `json:"rejectRate"`
+	Reasons           map[string]int `json:"reasons,omitempty"`
+}
+
 type RuntimeLoopSnapshot struct {
 	Cycle   int
 	Summary RuntimeSummary
@@ -91,6 +137,7 @@ type scanCounts struct {
 	RejectReasons   map[string]int
 	ApprovedBlocked []CandidateOutcome
 	Admission       map[string]*CandidateAdmissionSummary
+	Coverage        map[string]*CandidateCoverageRow
 }
 
 func NewEngine(cfg Config) (*Engine, error) {
@@ -106,6 +153,7 @@ func NewEngine(cfg Config) (*Engine, error) {
 		Now:              time.Now,
 		SelectUniverse:   SelectUniverse,
 		FetchOrderBook:   defaultOrderBookFetcher,
+		FetchMarketBook:  defaultMarketOrderBookFetcher,
 		RunTradeRecorder: defaultTradeTapeRecorderRunner,
 		RunL2Recorder:    defaultL2RecorderRunner,
 		BuildCandidates: runtime.PlaybookCandidateBuilder{
@@ -198,8 +246,11 @@ func (e *Engine) RunOnce() (RuntimeSummary, error) {
 	summary.SelectedSymbols = len(universe.Selected)
 	summary.Venues = uniqueUniverseVenues(universe.Selected)
 	summary.SelectedUniverse = append([]UniverseEntry(nil), universe.Selected...)
+	summary.QualifiedSkipped = append([]QualifiedNotSelected(nil), universe.QualifiedSkipped...)
+	summary.UniverseBiasDiagnostics = universe.BiasDiagnostics
 	summary.DiscoveryStats = append([]VenueDiscoveryStats(nil), universe.Stats...)
 	summary.QualificationDiagnostics = append([]QualificationDiagnostics(nil), universe.Diagnostics...)
+	_ = AppendStrategyReviewSelected(e.Config, summary.SelectedUniverse, now)
 	for _, note := range universe.Notes {
 		e.recordSystemEvent("universe_notice", []string{note})
 	}
@@ -213,9 +264,13 @@ func (e *Engine) RunOnce() (RuntimeSummary, error) {
 	summary.RejectReasons = counts.RejectReasons
 	summary.ApprovedBlocked = append([]CandidateOutcome(nil), counts.ApprovedBlocked...)
 	summary.CandidateAdmission = admissionSummaryRows(counts.Admission)
+	summary.CandidateCoverage = candidateCoverageRows(counts.Coverage)
 	summary.OpenCount = len(e.State.OpenPositions)
 	summary.RecentClosed = len(e.State.RecentClosed)
 	summary.StateBlockers = BuildStateBlockers(e.State, e.Config, e.Now().UTC().UnixMilli())
+	if err := WriteRankingJSON(e.Config, summary, e.State); err != nil {
+		return summary, err
+	}
 	if err := e.recordScannerCycleSummary(summary); err != nil {
 		return summary, err
 	}
@@ -223,6 +278,24 @@ func (e *Engine) RunOnce() (RuntimeSummary, error) {
 		return summary, err
 	}
 	if err := WriteRejectSummaryJSON(e.Config, summary.RejectReasons); err != nil {
+		return summary, err
+	}
+	if err := WriteCandidateCoverageJSON(e.Config, summary.CandidateCoverage); err != nil {
+		return summary, err
+	}
+	if err := WriteCandidateQualityJSON(e.Config, summary.CandidateCoverage); err != nil {
+		return summary, err
+	}
+	if err := WriteOpportunityCoverageJSON(e.Config, summary); err != nil {
+		return summary, err
+	}
+	if err := AppendStrategyReviewPositions(e.Config, e.State.OpenPositions, e.Now().UTC().UnixMilli()); err != nil {
+		return summary, err
+	}
+	if err := AppendStrategyReviewCycle(e.Config, summary, e.Now().UTC().UnixMilli()); err != nil {
+		return summary, err
+	}
+	if err := WriteOvernightStrategySummary(e.Config, summary); err != nil {
 		return summary, err
 	}
 	return summary, SaveState(e.Config, e.State)
@@ -592,6 +665,9 @@ func (e *Engine) recordDecision(candidate Candidate, decision RiskDecision, now 
 		e.State.RecentDecisions = e.State.RecentDecisions[:25]
 	}
 	_ = AppendEvent(e.Config, event)
+	if !decision.Allowed {
+		_ = AppendStrategyReviewEvent(e.Config, "rejection", event)
+	}
 }
 
 func (e *Engine) recordCandidateEvent(eventType string, candidate Candidate, now int64, reasons []string) {
@@ -610,6 +686,12 @@ func (e *Engine) recordCandidateEvent(eventType string, candidate Candidate, now
 		StopDistance: math.Abs(candidate.EntryPrice - candidate.StopPrice),
 	}
 	_ = AppendEvent(e.Config, event)
+	if eventType == "CANDIDATE_CREATED" {
+		_ = AppendStrategyReviewEvent(e.Config, "candidate", event)
+	}
+	if strings.Contains(strings.ToLower(eventType), "rejected") {
+		_ = AppendStrategyReviewEvent(e.Config, "rejection", event)
+	}
 }
 
 func (e *Engine) revalue() {
@@ -675,15 +757,20 @@ func (e *Engine) decisionCounts() (int, int, int) {
 }
 
 func (e *Engine) scanOnce(universe []UniverseEntry) (scanCounts, error) {
-	counts := scanCounts{RejectReasons: map[string]int{}, Admission: map[string]*CandidateAdmissionSummary{}}
+	counts := scanCounts{RejectReasons: map[string]int{}, Admission: map[string]*CandidateAdmissionSummary{}, Coverage: map[string]*CandidateCoverageRow{}}
 	snapshots := make([]orderbook.OrderBookSnapshot, 0)
+	entryBySnapshot := map[string]UniverseEntry{}
 	for _, entry := range universe {
-		snapshot, err := e.FetchOrderBook(entry.Venue, entry.Symbol)
+		coverageFor(counts.Coverage, entry)
+		snapshot, err := e.fetchOrderBookForUniverseEntry(entry)
 		if err != nil {
 			e.recordSystemEvent("recorder_error", []string{fmt.Sprintf("orderbook_fetch_failed:%s:%s", entry.Venue, entry.Symbol), err.Error()})
+			coverageFor(counts.Coverage, entry).RejectReasons["orderbook_fetch_failed"]++
 			continue
 		}
+		coverageFor(counts.Coverage, entry).SnapshotFetched = true
 		snapshots = append(snapshots, snapshot)
+		entryBySnapshot[venueSymbolKey(snapshot.Venue, snapshot.Symbol)] = entry
 		_ = AppendEvent(e.Config, TelemetryEvent{
 			Timestamp: e.Now().UTC().UnixMilli(),
 			Type:      "SCANNER_SNAPSHOT",
@@ -709,6 +796,8 @@ func (e *Engine) scanOnce(universe []UniverseEntry) (scanCounts, error) {
 
 	syntheticOpened := false
 	for _, snapshot := range snapshots {
+		entry := entryBySnapshot[venueSymbolKey(snapshot.Venue, snapshot.Symbol)]
+		coverage := coverageFor(counts.Coverage, entry)
 		candidates := e.BuildCandidates.BuildCandidates(runtime.ContextFromOrderBook(snapshot))
 		if len(candidates) == 0 {
 			candidate, ok := e.syntheticCandidate(snapshot, syntheticOpened)
@@ -722,6 +811,8 @@ func (e *Engine) scanOnce(universe []UniverseEntry) (scanCounts, error) {
 				counts.Decisions++
 				counts.Rejected++
 				counts.RejectReasons["no_runtime_candidate"]++
+				coverage.Rejected++
+				coverage.RejectReasons["no_runtime_candidate"]++
 				continue
 			}
 			e.recordSystemEvent("CANDIDATE_CREATED", []string{"synthetic_test_candidate", snapshot.Venue, snapshot.Symbol})
@@ -729,16 +820,22 @@ func (e *Engine) scanOnce(universe []UniverseEntry) (scanCounts, error) {
 		}
 		candidates, deduped := e.dedupeCandidates(candidates)
 		for _, candidate := range deduped {
+			coverage.Candidates++
+			coverage.ConfidenceSum += candidate.Confidence
 			admissionFor(counts.Admission, candidate.Venue).Created++
 			admissionFor(counts.Admission, candidate.Venue).Deduped++
 			counts.Decisions++
 			counts.Rejected++
 			counts.RejectReasons["deduped_out"]++
+			coverage.Rejected++
+			coverage.RejectReasons["deduped_out"]++
 			outcome := CandidateOutcome{Candidate: candidate, Status: "deduped_out", Reason: "same_venue_symbol_side"}
 			counts.ApprovedBlocked = append(counts.ApprovedBlocked, outcome)
 			e.recordCandidateEvent("CANDIDATE_REJECTED", candidate, e.Now().UTC().UnixMilli(), []string{"deduped_out", "same_venue_symbol_side"})
 		}
 		for _, candidate := range candidates {
+			coverage.Candidates++
+			coverage.ConfidenceSum += candidate.Confidence
 			admissionFor(counts.Admission, candidate.Venue).Created++
 			e.recordCandidateEvent("CANDIDATE_CREATED", candidate, e.Now().UTC().UnixMilli(), candidate.Reasons)
 			if reason := e.positionPolicyBlockReason(candidate); reason != "" {
@@ -748,6 +845,8 @@ func (e *Engine) scanOnce(universe []UniverseEntry) (scanCounts, error) {
 				counts.Decisions++
 				counts.Rejected++
 				counts.RejectReasons[reason]++
+				coverage.Rejected++
+				coverage.RejectReasons[reason]++
 				admissionFor(counts.Admission, candidate.Venue).PortfolioBlocked++
 				counts.ApprovedBlocked = append(counts.ApprovedBlocked, CandidateOutcome{Candidate: candidate, Status: "portfolio_blocked", Reason: reason})
 				continue
@@ -759,6 +858,7 @@ func (e *Engine) scanOnce(universe []UniverseEntry) (scanCounts, error) {
 			counts.Decisions++
 			if decision.Allowed {
 				counts.Approved++
+				coverage.Approved++
 				admissionFor(counts.Admission, candidate.Venue).Approved++
 				if position == nil {
 					counts.ApprovedBlocked = append(counts.ApprovedBlocked, CandidateOutcome{
@@ -770,6 +870,7 @@ func (e *Engine) scanOnce(universe []UniverseEntry) (scanCounts, error) {
 				syntheticOpened = true
 			} else {
 				counts.Rejected++
+				coverage.Rejected++
 				classification := classifyRejectReasons(decision.Reasons)
 				switch classification {
 				case "state":
@@ -781,11 +882,54 @@ func (e *Engine) scanOnce(universe []UniverseEntry) (scanCounts, error) {
 				}
 				for _, reason := range decision.Reasons {
 					counts.RejectReasons[reason]++
+					coverage.RejectReasons[reason]++
 				}
 			}
 		}
 	}
 	return counts, nil
+}
+
+func (e *Engine) fetchOrderBookForUniverseEntry(entry UniverseEntry) (orderbook.OrderBookSnapshot, error) {
+	if strings.EqualFold(entry.Venue, "lighter") && strings.TrimSpace(entry.MarketID) != "" {
+		marketID, err := strconv.Atoi(strings.TrimSpace(entry.MarketID))
+		if err != nil {
+			return orderbook.OrderBookSnapshot{}, fmt.Errorf("invalid lighter market id %q for %s: %w", entry.MarketID, entry.Symbol, err)
+		}
+		return e.FetchMarketBook(entry.Venue, entry.Symbol, marketID)
+	}
+	return e.FetchOrderBook(entry.Venue, entry.Symbol)
+}
+
+func coverageFor(rows map[string]*CandidateCoverageRow, entry UniverseEntry) *CandidateCoverageRow {
+	key := venueSymbolKey(entry.Venue, entry.Symbol)
+	if rows[key] == nil {
+		rows[key] = &CandidateCoverageRow{
+			Venue:           strings.ToLower(strings.TrimSpace(entry.Venue)),
+			Symbol:          strings.ToUpper(strings.TrimSpace(entry.Symbol)),
+			CanonicalSymbol: strings.ToUpper(strings.TrimSpace(entry.CanonicalSymbol)),
+			Major:           isMajorCanonical(entry.CanonicalSymbol),
+			RejectReasons:   map[string]int{},
+		}
+	}
+	return rows[key]
+}
+
+func candidateCoverageRows(rows map[string]*CandidateCoverageRow) []CandidateCoverageRow {
+	keys := make([]string, 0, len(rows))
+	for key := range rows {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]CandidateCoverageRow, 0, len(keys))
+	for _, key := range keys {
+		row := *rows[key]
+		if row.Candidates > 0 {
+			row.AverageConfidence = row.ConfidenceSum / float64(row.Candidates)
+		}
+		out = append(out, row)
+	}
+	return out
 }
 
 func (e *Engine) dedupeCandidates(candidates []Candidate) ([]Candidate, []Candidate) {
@@ -1016,6 +1160,15 @@ func defaultOrderBookFetcher(venue string, symbol string) (orderbook.OrderBookSn
 		return lighter.GetMainnetOrderBook(normalizePaperPerpSymbol(symbol))
 	default:
 		return orderbook.OrderBookSnapshot{}, fmt.Errorf("unsupported venue %q", venue)
+	}
+}
+
+func defaultMarketOrderBookFetcher(venue string, symbol string, marketID int) (orderbook.OrderBookSnapshot, error) {
+	switch strings.ToLower(strings.TrimSpace(venue)) {
+	case "lighter":
+		return lighter.GetMainnetOrderBookByMarketID(symbol, marketID)
+	default:
+		return defaultOrderBookFetcher(venue, symbol)
 	}
 }
 

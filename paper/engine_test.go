@@ -96,6 +96,39 @@ func TestRunLoopExecutesConfiguredRuntimeCycle(t *testing.T) {
 	}
 }
 
+func TestFetchOrderBookForLighterUniverseEntryUsesMarketID(t *testing.T) {
+	cfg := tempConfig(t)
+	engine, err := NewEngine(cfg)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine.FetchOrderBook = func(venue string, symbol string) (orderbook.OrderBookSnapshot, error) {
+		t.Fatalf("symbol-only fetcher should not be used for lighter market-id entries")
+		return orderbook.OrderBookSnapshot{}, nil
+	}
+	called := false
+	engine.FetchMarketBook = func(venue string, symbol string, marketID int) (orderbook.OrderBookSnapshot, error) {
+		called = true
+		if venue != "lighter" || symbol != "1000PEPE" || marketID != 4 {
+			t.Fatalf("unexpected market-id route: venue=%s symbol=%s marketID=%d", venue, symbol, marketID)
+		}
+		return orderbook.OrderBookSnapshot{
+			Venue:      venue,
+			Symbol:     symbol,
+			Bids:       []orderbook.BookLevel{{Price: "1", Size: "10"}},
+			Asks:       []orderbook.BookLevel{{Price: "1.01", Size: "10"}},
+			IsSnapshot: true,
+		}, nil
+	}
+	snapshot, err := engine.fetchOrderBookForUniverseEntry(UniverseEntry{Venue: "lighter", Symbol: "1000PEPE", MarketID: "4"})
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if !called || snapshot.Symbol != "1000PEPE" {
+		t.Fatalf("expected market-id fetch, called=%t snapshot=%+v", called, snapshot)
+	}
+}
+
 func TestNewEngineResetStateClearsSavedBlockers(t *testing.T) {
 	cfg := tempConfig(t)
 	state := NewState(cfg)
@@ -461,5 +494,67 @@ func TestScanKeepsCrossVenueSymbolRoutesDistinct(t *testing.T) {
 	}
 	if engine.State.DailyTradeCount["hyperliquid:BTC"] != 1 || engine.State.DailyTradeCount["lighter:BTC"] != 1 {
 		t.Fatalf("expected venue-specific daily counts, got %+v", engine.State.DailyTradeCount)
+	}
+}
+
+func TestScanRecordsNonMajorCandidateCoverage(t *testing.T) {
+	cfg := tempConfig(t)
+	cfg.EnableRecorders = false
+	engine, err := NewEngine(cfg)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	engine.BuildCandidates = testCandidateBuilder{candidates: []Candidate{
+		{Strategy: "coverage", Playbook: "coverage", Side: "LONG", Score: 0.70, Confidence: 0.70, StopPrice: 99, TP1: 102, TP2: 103, TP3: 104},
+	}}
+	engine.FetchOrderBook = func(venue string, symbol string) (orderbook.OrderBookSnapshot, error) {
+		s := testSnapshot()
+		s.Venue = venue
+		s.Symbol = symbol
+		return s, nil
+	}
+
+	counts, err := engine.scanOnce([]UniverseEntry{{Venue: "hyperliquid", Symbol: "ARB", CanonicalSymbol: "ARB"}})
+	if err != nil {
+		t.Fatalf("scan once: %v", err)
+	}
+	rows := candidateCoverageRows(counts.Coverage)
+	if len(rows) != 1 || rows[0].Major || rows[0].Candidates != 1 || !rows[0].SnapshotFetched {
+		t.Fatalf("unexpected candidate coverage rows: %+v", rows)
+	}
+}
+
+func TestPaperLiveCandidateParityForBroadenedAsset(t *testing.T) {
+	cfg := tempConfig(t)
+	cfg.EnableRecorders = false
+	engine, err := NewEngine(cfg)
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	snapshot := orderbook.OrderBookSnapshot{
+		Venue:  "hyperliquid",
+		Symbol: "ARB",
+		Bids:   []orderbook.BookLevel{{Price: "100", Size: "10"}},
+		Asks:   []orderbook.BookLevel{{Price: "100.1", Size: "10"}},
+	}
+	builder := testCandidateBuilder{candidates: []Candidate{
+		{Strategy: "parity", Playbook: "parity", Side: "LONG", Score: 0.70, Confidence: 0.70, StopPrice: 99, TP1: 102, TP2: 103, TP3: 104},
+	}}
+	engine.BuildCandidates = builder
+	paperCandidate := builder.BuildCandidates(runtime.ContextFromOrderBook(snapshot))[0]
+	liveCandidate := engine.BuildCandidates.BuildCandidates(runtime.ContextFromOrderBook(snapshot))[0]
+	if paperCandidate.Venue != liveCandidate.Venue ||
+		paperCandidate.Symbol != liveCandidate.Symbol ||
+		paperCandidate.Side != liveCandidate.Side ||
+		paperCandidate.EntryPrice != liveCandidate.EntryPrice ||
+		paperCandidate.StopPrice != liveCandidate.StopPrice ||
+		paperCandidate.TP1 != liveCandidate.TP1 ||
+		paperCandidate.Confidence != liveCandidate.Confidence {
+		t.Fatalf("paper/live candidate parity failed paper=%+v live=%+v", paperCandidate, liveCandidate)
+	}
+	paperRisk := CheckRisk(engine.State, paperCandidate, cfg, engine.Now().UTC().UnixMilli())
+	liveRisk := CheckRisk(engine.State, liveCandidate, cfg, engine.Now().UTC().UnixMilli())
+	if paperRisk.Allowed != liveRisk.Allowed || strings.Join(paperRisk.Reasons, ",") != strings.Join(liveRisk.Reasons, ",") {
+		t.Fatalf("paper/live risk parity failed paper=%+v live=%+v", paperRisk, liveRisk)
 	}
 }

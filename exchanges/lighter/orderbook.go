@@ -37,6 +37,26 @@ func GetMainnetOrderBook(symbol string) (orderbook.OrderBookSnapshot, error) {
 	if err != nil {
 		return orderbook.OrderBookSnapshot{}, err
 	}
+	return GetMainnetOrderBookByMarketID(normalized, int(marketID))
+}
+
+func GetOrderBookByMarketID(symbol string, marketID int) (orderbook.OrderBookSnapshot, error) {
+	normalized := strings.ToUpper(strings.TrimSpace(symbol))
+	if normalized == "" {
+		return orderbook.OrderBookSnapshot{}, fmt.Errorf("lighter symbol is required")
+	}
+	snapshot, err := getOrderBookFromBaseURL(getBaseURL(), normalized, marketID)
+	if err == nil {
+		return snapshot, nil
+	}
+	return getOrderBookViaWSAt(getWSURL(), marketID, normalized)
+}
+
+func GetMainnetOrderBookByMarketID(symbol string, marketID int) (orderbook.OrderBookSnapshot, error) {
+	normalized := strings.ToUpper(strings.TrimSpace(symbol))
+	if normalized == "" {
+		return orderbook.OrderBookSnapshot{}, fmt.Errorf("lighter symbol is required")
+	}
 	snapshot, err := getOrderBookFromBaseURL("https://mainnet.zklighter.elliot.ai", normalized, int(marketID))
 	if err == nil {
 		return snapshot, nil

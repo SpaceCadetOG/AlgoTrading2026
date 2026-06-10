@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -20,6 +23,7 @@ import (
 	"AlgoTrading2026/exchanges/aster"
 	"AlgoTrading2026/exchanges/hyperliquid"
 	"AlgoTrading2026/exchanges/lighter"
+	"AlgoTrading2026/execution"
 	"AlgoTrading2026/features"
 	"AlgoTrading2026/indicators"
 	runtime "AlgoTrading2026/internal/runtime"
@@ -358,14 +362,15 @@ func runLiveRuntime() {
 	if err != nil {
 		log.Fatalf("init live runtime: %v", err)
 	}
-
-	client := aster.NewClient(asterEnv("USER"), asterEnv("SIGNER"), asterEnv("PRIVATE_KEY"))
+	live := buildLiveRuntime()
+	hybrid := runtime.NewHybridReconciler()
 	executor := runtime.LiveExecutor{
-		Placer: client,
+		Placer: runtime.RoutedOrderPlacer{Placers: live.Placers},
 		Gate:   runtime.LiveGateFromEnv(),
 	}
 
 	ctx := runtimeContext()
+	startLiveStreamReconcilers(ctx, live, hybrid)
 	interval := time.Duration(cfg.ScanIntervalSeconds) * time.Second
 	if interval <= 0 {
 		interval = 30 * time.Second
@@ -375,8 +380,6 @@ func runLiveRuntime() {
 	fmt.Printf("mode=%s\n", cfg.Mode)
 	fmt.Printf("gateLiveEnabled=%t\n", executor.Gate.LiveEnabled)
 	fmt.Printf("gateExecutionEnabled=%t\n", executor.Gate.ExecutionEnabled)
-	fmt.Printf("gateVenueHealthy=%t\n", executor.Gate.VenueHealthy)
-	fmt.Printf("gateAccountReady=%t\n", executor.Gate.AccountReady)
 	fmt.Printf("scanIntervalSeconds=%d\n", int(interval/time.Second))
 	for {
 		select {
@@ -386,12 +389,34 @@ func runLiveRuntime() {
 		default:
 		}
 		cycle++
-		summary, err := runLiveCycle(engine, executor, cfg)
+		summary, err := runLiveCycle(engine, executor, live, hybrid, cfg)
 		if err != nil {
 			log.Fatalf("run live cycle: %v", err)
 		}
-		fmt.Printf("cycle=%d selectedSymbols=%d decisions=%d approved=%d refused=%d placed=%d\n",
-			cycle, summary.SelectedSymbols, summary.Decisions, summary.Approved, summary.Rejected, summary.OpenCount)
+		fmt.Printf("cycle=%d universeMode=%s selectedSymbols=%d venues=%d decisions=%d approved=%d refused=%d placed=%d\n",
+			cycle, summary.UniverseMode, summary.SelectedSymbols, summary.Venues, summary.Decisions, summary.Approved, summary.Rejected, summary.OpenCount)
+		if cfg.OvernightLogMode {
+			printCandidateQuality(summary.CandidateCoverage)
+			if cfg.MaxRuntimeCycles > 0 && cycle >= cfg.MaxRuntimeCycles {
+				fmt.Println("status=max_cycles_reached")
+				return
+			}
+			timer := time.NewTimer(interval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				fmt.Println("status=stopped")
+				return
+			case <-timer.C:
+			}
+			continue
+		}
+		printVenueDiscovery(summary)
+		printSelectedUniverse(summary.SelectedUniverse, 10)
+		printQualifiedNotSelected(summary.QualifiedSkipped, 5)
+		printCandidateAdmission(summary.CandidateAdmission)
+		printCandidateQuality(summary.CandidateCoverage)
+		printRejectSummary(summary.RejectReasons, 10)
 		if cfg.MaxRuntimeCycles > 0 && cycle >= cfg.MaxRuntimeCycles {
 			fmt.Println("status=max_cycles_reached")
 			return
@@ -407,10 +432,39 @@ func runLiveRuntime() {
 	}
 }
 
-func runLiveCycle(engine *paper.Engine, executor runtime.LiveExecutor, cfg paper.Config) (paper.RuntimeSummary, error) {
-	summary := paper.RuntimeSummary{}
+type liveRuntimeWiring struct {
+	Placers     map[string]execution.OrderPlacer
+	Reconcilers map[string]runtime.Reconciler
+	Health      map[string]runtime.VenueHealthChecker
+	Lighter     *lighter.Client
+}
+
+func runLiveCycle(engine *paper.Engine, executor runtime.LiveExecutor, live liveRuntimeWiring, hybrid *runtime.HybridReconciler, cfg paper.Config) (paper.RuntimeSummary, error) {
+	summary := paper.RuntimeSummary{Mode: "live", ExecutionMode: "real", LiveEnabled: executor.Gate.LiveEnabled, RejectReasons: map[string]int{}}
 	if err := paper.EnsureDataFiles(cfg); err != nil {
 		return summary, err
+	}
+	healthSnapshot := runtime.BuildHealthSnapshot(live.Health)
+	healthRoot := config.DataPath("live")
+	if err := runtime.WriteHealthSnapshots(healthRoot, healthSnapshot); err != nil {
+		return summary, err
+	}
+	healthByVenue := runtime.HealthByVenue(healthSnapshot)
+	if !cfg.OvernightLogMode {
+		printLiveHealth(healthSnapshot)
+		printVenueStreamStatus(healthSnapshot)
+	}
+	gateStatus := runtime.BuildVenueGateStatus(healthSnapshot)
+	if err := runtime.WriteVenueGateStatus(healthRoot, gateStatus); err != nil {
+		return summary, err
+	}
+	for _, health := range healthSnapshot.Venues {
+		if err := runtime.WriteVenueReadinessAudit(healthRoot, runtime.BuildVenueReadinessAudit(health)); err != nil {
+			return summary, err
+		}
+	}
+	if !cfg.OvernightLogMode {
+		printVenueGateStatus(gateStatus)
 	}
 	now := time.Now().UTC().UnixMilli()
 	if err := paper.AppendEvent(cfg, paper.TelemetryEvent{
@@ -421,22 +475,25 @@ func runLiveCycle(engine *paper.Engine, executor runtime.LiveExecutor, cfg paper
 	}); err != nil {
 		return summary, err
 	}
-	if err := paper.AppendEvent(cfg, paper.TelemetryEvent{
-		Timestamp: now,
-		Type:      "VENUE_HEALTH",
-		Decision:  "system",
-		Reasons: []string{
-			fmt.Sprintf("venueHealthy=%t", executor.Gate.VenueHealthy),
-			fmt.Sprintf("accountReady=%t", executor.Gate.AccountReady),
-			fmt.Sprintf("killSwitch=%t", executor.Gate.KillSwitchActive),
-		},
-	}); err != nil {
-		return summary, err
+	for _, health := range healthSnapshot.Venues {
+		if err := paper.AppendEvent(cfg, paper.TelemetryEvent{
+			Timestamp: now,
+			Type:      "VENUE_HEALTH",
+			Venue:     health.Venue,
+			Decision:  "system",
+			Reasons: append([]string{
+				fmt.Sprintf("healthy=%t", health.Healthy),
+				fmt.Sprintf("accountReady=%t", health.AccountReady),
+				fmt.Sprintf("positionSyncReady=%t", health.PositionSyncReady),
+				fmt.Sprintf("fillHistoryReady=%t", health.FillHistoryReady),
+				fmt.Sprintf("protectionReady=%t", health.ProtectionReady),
+				fmt.Sprintf("reconciliationReady=%t", health.ReconciliationReady),
+				fmt.Sprintf("protection=%s", health.Protection.Reason),
+			}, health.Reasons...),
+		}); err != nil {
+			return summary, err
+		}
 	}
-	decisions := 0
-	approved := 0
-	refused := 0
-	placed := 0
 	universe, err := engine.SelectUniverse(cfg)
 	if err != nil {
 		return summary, err
@@ -445,12 +502,30 @@ func runLiveCycle(engine *paper.Engine, executor runtime.LiveExecutor, cfg paper
 	summary.Min24hVolumeUSD = universe.Min24hVolumeUSD
 	summary.SelectedSymbols = len(universe.Selected)
 	summary.Venues = len(cfg.Venues)
+	summary.SelectedUniverse = append([]paper.UniverseEntry(nil), universe.Selected...)
+	summary.QualifiedSkipped = append([]paper.QualifiedNotSelected(nil), universe.QualifiedSkipped...)
+	summary.UniverseBiasDiagnostics = universe.BiasDiagnostics
+	summary.DiscoveryStats = append([]paper.VenueDiscoveryStats(nil), universe.Stats...)
+	summary.QualificationDiagnostics = append([]paper.QualificationDiagnostics(nil), universe.Diagnostics...)
+	admission := map[string]*paper.CandidateAdmissionSummary{}
+	coverage := map[string]*paper.CandidateCoverageRow{}
+	if hybrid == nil {
+		hybrid = runtime.NewHybridReconciler()
+	}
+	for venue := range live.Health {
+		hybrid.SetStreamStatus(liveStreamStatus(venue))
+	}
+	reconcileResults := []runtime.ReconcileResult{}
 	for _, entry := range universe.Selected {
+		coverageRow := liveCoverageFor(coverage, entry)
 		snapshot, err := engine.FetchOrderBook(entry.Venue, entry.Symbol)
 		if err != nil {
 			log.Printf("live snapshot failed venue=%s symbol=%s: %v", entry.Venue, entry.Symbol, err)
+			coverageRow.Rejected++
+			coverageRow.RejectReasons["orderbook_fetch_failed"]++
 			continue
 		}
+		coverageRow.SnapshotFetched = true
 		_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
 			Timestamp: time.Now().UTC().UnixMilli(),
 			Type:      "SCANNER_SNAPSHOT",
@@ -463,8 +538,15 @@ func runLiveCycle(engine *paper.Engine, executor runtime.LiveExecutor, cfg paper
 			},
 		})
 		candidates := engine.BuildCandidates.BuildCandidates(runtime.ContextFromOrderBook(snapshot))
+		if len(candidates) == 0 {
+			coverageRow.Rejected++
+			coverageRow.RejectReasons["no_runtime_candidate"]++
+		}
 		for _, candidate := range candidates {
-			decisions++
+			coverageRow.Candidates++
+			coverageRow.ConfidenceSum += candidate.Confidence
+			admissionForConsole(admission, candidate.Venue).Created++
+			summary.Decisions++
 			_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
 				Timestamp:  time.Now().UTC().UnixMilli(),
 				Type:       "CANDIDATE_CREATED",
@@ -478,9 +560,62 @@ func runLiveCycle(engine *paper.Engine, executor runtime.LiveExecutor, cfg paper
 				Entry:      candidate.EntryPrice,
 				Reasons:    candidate.Reasons,
 			})
+			_ = paper.AppendStrategyReviewEvent(liveReviewConfig(cfg), "candidate", paper.TelemetryEvent{
+				Timestamp:  time.Now().UTC().UnixMilli(),
+				Type:       "CANDIDATE_CREATED",
+				Symbol:     candidate.Symbol,
+				Venue:      candidate.Venue,
+				Side:       candidate.Side,
+				Strategy:   candidate.Strategy,
+				Playbook:   candidate.Playbook,
+				Score:      candidate.Score,
+				Confidence: candidate.Confidence,
+				Entry:      candidate.EntryPrice,
+				Reasons:    candidate.Reasons,
+			})
+			venueHealth := healthByVenue[strings.ToLower(strings.TrimSpace(candidate.Venue))]
+			if reason := venueHealth.RefusalReason(); reason != "" {
+				summary.Rejected++
+				summary.RejectReasons["live_health_blocked"]++
+				coverageRow.Rejected++
+				coverageRow.RejectReasons["live_health_blocked"]++
+				admissionForConsole(admission, candidate.Venue).StateBlocked++
+				_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
+					Timestamp: time.Now().UTC().UnixMilli(),
+					Type:      "EXECUTION_BLOCKED",
+					Symbol:    candidate.Symbol,
+					Venue:     candidate.Venue,
+					Side:      candidate.Side,
+					Strategy:  candidate.Strategy,
+					Playbook:  candidate.Playbook,
+					Decision:  "refused",
+					Reasons:   []string{reason},
+				})
+				_ = paper.AppendStrategyReviewEvent(liveReviewConfig(cfg), "rejection", paper.TelemetryEvent{
+					Timestamp:  time.Now().UTC().UnixMilli(),
+					Type:       "EXECUTION_BLOCKED",
+					Symbol:     candidate.Symbol,
+					Venue:      candidate.Venue,
+					Side:       candidate.Side,
+					Strategy:   candidate.Strategy,
+					Playbook:   candidate.Playbook,
+					Score:      candidate.Score,
+					Confidence: candidate.Confidence,
+					Decision:   "refused",
+					Entry:      candidate.EntryPrice,
+					Reasons:    []string{reason},
+				})
+				continue
+			}
 			riskDecision := paper.CheckRisk(engine.State, candidate, cfg, time.Now().UTC().UnixMilli())
 			if !riskDecision.Allowed {
-				refused++
+				summary.Rejected++
+				admissionForConsole(admission, candidate.Venue).RiskRejected++
+				coverageRow.Rejected++
+				for _, reason := range riskDecision.Reasons {
+					summary.RejectReasons[reason]++
+					coverageRow.RejectReasons[reason]++
+				}
 				_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
 					Timestamp:  time.Now().UTC().UnixMilli(),
 					Type:       "RISK_REJECTED",
@@ -493,9 +628,27 @@ func runLiveCycle(engine *paper.Engine, executor runtime.LiveExecutor, cfg paper
 					Confidence: candidate.Confidence,
 					Reasons:    riskDecision.Reasons,
 				})
+				_ = paper.AppendStrategyReviewEvent(liveReviewConfig(cfg), "rejection", paper.TelemetryEvent{
+					Timestamp:  time.Now().UTC().UnixMilli(),
+					Type:       "RISK_REJECTED",
+					Symbol:     candidate.Symbol,
+					Venue:      candidate.Venue,
+					Side:       candidate.Side,
+					Strategy:   candidate.Strategy,
+					Playbook:   candidate.Playbook,
+					Score:      candidate.Score,
+					Confidence: candidate.Confidence,
+					Decision:   "rejected",
+					Entry:      candidate.EntryPrice,
+					Reasons:    riskDecision.Reasons,
+				})
 				continue
 			}
-			approved++
+			summary.Approved++
+			coverageRow.Approved++
+			admissionForConsole(admission, candidate.Venue).Approved++
+			protection := runtime.BuildProtectionPlan(candidate)
+			recordProtectionEvents(cfg, candidate, protection)
 			_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
 				Timestamp:  time.Now().UTC().UnixMilli(),
 				Type:       "EXECUTION_REQUESTED",
@@ -506,9 +659,25 @@ func runLiveCycle(engine *paper.Engine, executor runtime.LiveExecutor, cfg paper
 				Playbook:   candidate.Playbook,
 				Score:      candidate.Score,
 				Confidence: candidate.Confidence,
-				Reasons:    candidate.Reasons,
+				Reasons: append(append([]string{}, candidate.Reasons...),
+					"protectionMode="+protection.Mode,
+					"protectionReason="+protection.Reason,
+				),
 			})
-			result, err := executor.Execute(runtime.ExecutionDecision{
+			venueExecutor := executor
+			venueExecutor.Gate = runtime.HealthGateFromSnapshot(executor.Gate, venueHealth)
+			_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
+				Timestamp: time.Now().UTC().UnixMilli(),
+				Type:      "ORDER_SUBMITTED",
+				Symbol:    candidate.Symbol,
+				Venue:     candidate.Venue,
+				Side:      candidate.Side,
+				Strategy:  candidate.Strategy,
+				Playbook:  candidate.Playbook,
+				Decision:  "submitted",
+				Reasons:   []string{"protectionMode=" + protection.Mode},
+			})
+			result, err := venueExecutor.Execute(runtime.ExecutionDecision{
 				Candidate: candidate,
 				Risk:      runtime.RiskDecision{Allowed: riskDecision.Allowed, Reasons: riskDecision.Reasons},
 				Mode:      "live",
@@ -517,10 +686,10 @@ func runLiveCycle(engine *paper.Engine, executor runtime.LiveExecutor, cfg paper
 				return summary, err
 			}
 			if result.Accepted {
-				placed++
+				summary.OpenCount++
 				_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
 					Timestamp: time.Now().UTC().UnixMilli(),
-					Type:      "ORDER_SUBMITTED",
+					Type:      "ORDER_ACKNOWLEDGED",
 					Symbol:    candidate.Symbol,
 					Venue:     candidate.Venue,
 					Side:      candidate.Side,
@@ -529,9 +698,12 @@ func runLiveCycle(engine *paper.Engine, executor runtime.LiveExecutor, cfg paper
 					Decision:  result.Status,
 					Reasons:   []string{result.OrderID},
 				})
-				fmt.Printf("live_order_accepted venue=%s symbol=%s orderID=%s status=%s\n", result.Venue, result.Symbol, result.OrderID, result.Status)
+				if !cfg.OvernightLogMode {
+					fmt.Printf("live_order_accepted venue=%s symbol=%s orderID=%s status=%s\n", result.Venue, result.Symbol, result.OrderID, result.Status)
+				}
 			} else {
-				refused++
+				summary.Rejected++
+				summary.RejectReasons[firstNonEmpty(result.Message, "execution_refused")]++
 				_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
 					Timestamp: time.Now().UTC().UnixMilli(),
 					Type:      "ORDER_REJECTED",
@@ -543,36 +715,757 @@ func runLiveCycle(engine *paper.Engine, executor runtime.LiveExecutor, cfg paper
 					Decision:  result.Status,
 					Reasons:   []string{result.Message},
 				})
-				fmt.Printf("live_order_refused venue=%s symbol=%s reason=%s\n", candidate.Venue, candidate.Symbol, result.Message)
+				if !cfg.OvernightLogMode {
+					fmt.Printf("live_order_refused venue=%s symbol=%s reason=%s\n", candidate.Venue, candidate.Symbol, result.Message)
+				}
 			}
+			reconciler := live.Reconcilers[strings.ToLower(strings.TrimSpace(candidate.Venue))]
+			if reconciler == nil {
+				reconciler = runtime.VenueReconciler{Venue: candidate.Venue}
+			}
+			reconciled, err := reconciler.Reconcile(runtime.ReconcileRequest{
+				Decision: runtime.ExecutionDecision{
+					Candidate: candidate,
+					Risk:      runtime.RiskDecision{Allowed: riskDecision.Allowed, Reasons: riskDecision.Reasons},
+					Mode:      "live",
+				},
+				Result: result,
+			})
+			if err != nil {
+				return summary, err
+			}
+			reconcileResults = append(reconcileResults, reconciled)
+			hybrid.ApplyPollingResult(reconciled)
+			recordReconcileEvents(cfg, candidate, reconciled)
 			break
 		}
-		if placed > 0 {
+		if summary.OpenCount > 0 {
 			break
 		}
 	}
-	summary.Decisions = decisions
-	summary.Approved = approved
-	summary.Rejected = refused
-	summary.OpenCount = placed
+	summary.CandidateAdmission = admissionRowsForConsole(admission)
+	summary.CandidateCoverage = liveCoverageRows(coverage)
+	if err := writeLiveReconcileArtifacts(healthRoot, reconcileResults); err != nil {
+		return summary, err
+	}
+	reconciliationState := hybrid.Snapshot()
+	if err := runtime.WriteReconciliationState(healthRoot, reconciliationState); err != nil {
+		return summary, err
+	}
+	if err := paper.WriteCandidateCoverageJSON(cfg, summary.CandidateCoverage); err != nil {
+		return summary, err
+	}
+	if err := paper.WriteCandidateQualityJSON(cfg, summary.CandidateCoverage); err != nil {
+		return summary, err
+	}
+	if err := paper.WriteOpportunityCoverageJSON(cfg, summary); err != nil {
+		return summary, err
+	}
+	if err := paper.AppendStrategyReviewSelected(liveReviewConfig(cfg), summary.SelectedUniverse, time.Now().UTC().UnixMilli()); err != nil {
+		return summary, err
+	}
+	if err := paper.AppendStrategyReviewPositions(liveReviewConfig(cfg), engine.State.OpenPositions, time.Now().UTC().UnixMilli()); err != nil {
+		return summary, err
+	}
+	if err := paper.AppendStrategyReviewCycle(liveReviewConfig(cfg), summary, time.Now().UTC().UnixMilli()); err != nil {
+		return summary, err
+	}
+	if err := paper.WriteOvernightStrategySummary(liveReviewConfig(cfg), summary); err != nil {
+		return summary, err
+	}
+	if !cfg.OvernightLogMode {
+		printLiveReconcile(reconcileResults)
+		printReconciliationHealth(reconciliationState)
+	}
 	_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
 		Timestamp: time.Now().UTC().UnixMilli(),
 		Type:      "SCANNER_CYCLE_SUMMARY",
 		Decision:  "system",
 		Reasons: []string{
-			fmt.Sprintf("decisions=%d", decisions),
-			fmt.Sprintf("approved=%d", approved),
-			fmt.Sprintf("refused=%d", refused),
-			fmt.Sprintf("placed=%d", placed),
+			fmt.Sprintf("decisions=%d", summary.Decisions),
+			fmt.Sprintf("approved=%d", summary.Approved),
+			fmt.Sprintf("refused=%d", summary.Rejected),
+			fmt.Sprintf("placed=%d", summary.OpenCount),
 		},
 	})
+	return summary, nil
+}
+
+func buildLiveRuntime() liveRuntimeWiring {
+	asterClient := aster.NewClient(asterEnv("USER"), asterEnv("SIGNER"), asterEnv("PRIVATE_KEY"))
+	hyperClient := hyperliquid.NewClient(os.Getenv("WALLET_ADDRESS"), os.Getenv("HYPERLIQUID_PRIVATE_KEY"))
+	lighterClient := lighter.NewClient(os.Getenv("WALLET_ADDRESS"))
+	return liveRuntimeWiring{
+		Placers: map[string]execution.OrderPlacer{
+			"aster":       asterClient,
+			"hyperliquid": hyperClient,
+			"lighter":     lighterClient,
+		},
+		Reconcilers: map[string]runtime.Reconciler{
+			"aster": runtime.VenueReconciler{
+				Venue:     "aster",
+				Orders:    asterOpenOrderReader{Client: asterClient},
+				Fills:     asterFillReader{Client: asterClient},
+				Positions: asterClient,
+			},
+			"hyperliquid": runtime.VenueReconciler{
+				Venue:     "hyperliquid",
+				Orders:    hyperliquidOpenOrderReader{Client: hyperClient},
+				Fills:     hyperliquidFillReader{Client: hyperClient},
+				Positions: hyperClient,
+			},
+			"lighter": runtime.VenueReconciler{
+				Venue:     "lighter",
+				Orders:    lighterOpenOrderReader{Client: lighterClient},
+				Fills:     lighterFillReader{Client: lighterClient},
+				Positions: lighterClient,
+			},
+		},
+		Health: map[string]runtime.VenueHealthChecker{
+			"aster": {
+				Venue:                 "aster",
+				Account:               asterClient,
+				Positions:             asterClient,
+				RequirePositions:      true,
+				RequireFills:          true,
+				Fills:                 asterFillReader{Client: asterClient},
+				MarketDataReady:       true,
+				PrivateEndpointsReady: asterEnv("PRIVATE_KEY") != "" && asterEnv("SIGNER") != "",
+				Protection:            runtime.ProtectionForVenue("aster"),
+				Stream:                liveStreamStatus("aster"),
+				RequireFreshStream:    envTruthy(os.Getenv("LIVE_REQUIRE_WEBSOCKET_RECONCILIATION")),
+			},
+			"hyperliquid": {
+				Venue:                 "hyperliquid",
+				Account:               hyperClient,
+				Positions:             hyperClient,
+				RequirePositions:      true,
+				RequireFills:          true,
+				Fills:                 hyperliquidFillReader{Client: hyperClient},
+				MarketDataReady:       true,
+				PrivateEndpointsReady: os.Getenv("WALLET_ADDRESS") != "" && os.Getenv("HYPERLIQUID_PRIVATE_KEY") != "",
+				Protection:            runtime.ProtectionForVenue("hyperliquid"),
+				Stream:                liveStreamStatus("hyperliquid"),
+				RequireFreshStream:    envTruthy(os.Getenv("LIVE_REQUIRE_WEBSOCKET_RECONCILIATION")),
+			},
+			"lighter": {
+				Venue:                 "lighter",
+				Account:               lighterClient,
+				Positions:             lighterClient,
+				RequirePositions:      true,
+				RequireFills:          true,
+				Fills:                 lighterFillReader{Client: lighterClient},
+				MarketDataReady:       true,
+				PrivateEndpointsReady: lighterExecutionEnvReady(),
+				Protection:            runtime.ProtectionForVenue("lighter"),
+				Stream:                liveStreamStatus("lighter"),
+				RequireFreshStream:    envTruthy(os.Getenv("LIVE_REQUIRE_WEBSOCKET_RECONCILIATION")),
+			},
+		},
+		Lighter: lighterClient,
+	}
+}
+
+type asterOpenOrderReader struct {
+	Client *aster.Client
+}
+
+func (r asterOpenOrderReader) OpenOrders(symbol string) ([]runtime.OrderSnapshot, error) {
+	rows, err := r.Client.GetOpenOrders(symbol)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]runtime.OrderSnapshot, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, runtime.OrderSnapshot{
+			Venue:     "aster",
+			Symbol:    row.Symbol,
+			Side:      row.Side,
+			OrderID:   strconv.FormatInt(row.OrderID, 10),
+			ClientID:  row.ClientOrderID,
+			Status:    row.Status,
+			OrderType: row.Type,
+			FilledQty: parseConsoleFloat(row.ExecutedQty),
+			Price:     parseConsoleFloat(firstNonEmpty(row.AvgPrice, row.Price)),
+			Raw:       row,
+		})
+	}
+	return out, nil
+}
+
+type asterFillReader struct {
+	Client *aster.Client
+}
+
+func (r asterFillReader) Fills(symbol string, orderID string) ([]runtime.FillSnapshot, error) {
+	if orderID == "" {
+		return nil, nil
+	}
+	order, err := r.Client.QueryOrder(symbol, orderID)
+	if err != nil {
+		return nil, err
+	}
+	qty := parseConsoleFloat(order.ExecutedQty)
+	if qty <= 0 {
+		return nil, nil
+	}
+	return []runtime.FillSnapshot{{
+		Venue:     "aster",
+		Symbol:    firstNonEmpty(order.Symbol, symbol),
+		Side:      order.Side,
+		OrderID:   strconv.FormatInt(order.OrderID, 10),
+		FillID:    strconv.FormatInt(order.OrderID, 10),
+		Quantity:  qty,
+		Price:     parseConsoleFloat(firstNonEmpty(order.AvgPrice, order.Price)),
+		Timestamp: order.UpdateTime,
+		Raw:       order,
+	}}, nil
+}
+
+type hyperliquidOpenOrderReader struct {
+	Client *hyperliquid.Client
+}
+
+func (r hyperliquidOpenOrderReader) OpenOrders(symbol string) ([]runtime.OrderSnapshot, error) {
+	rows, err := r.Client.GetOpenOrders()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]runtime.OrderSnapshot, 0, len(rows))
+	for _, row := range rows {
+		raw, _ := json.Marshal(row)
+		var obj map[string]any
+		_ = json.Unmarshal(raw, &obj)
+		coin := firstNonEmpty(stringFromAny(obj["coin"]), stringFromAny(obj["Coin"]))
+		if symbol != "" && coin != "" && !strings.EqualFold(coin, symbol) {
+			continue
+		}
+		out = append(out, runtime.OrderSnapshot{
+			Venue:     "hyperliquid",
+			Symbol:    firstNonEmpty(coin, symbol),
+			Side:      stringFromAny(firstMapValue(obj, "side", "Side")),
+			OrderID:   stringFromAny(firstMapValue(obj, "oid", "Oid", "orderId", "OrderID")),
+			Status:    firstNonEmpty(stringFromAny(firstMapValue(obj, "status", "Status")), "OPEN"),
+			OrderType: stringFromAny(firstMapValue(obj, "orderType", "OrderType")),
+			Price:     parseConsoleFloat(stringFromAny(firstMapValue(obj, "limitPx", "LimitPx", "price", "Price"))),
+			Raw:       row,
+		})
+	}
+	return out, nil
+}
+
+type hyperliquidFillReader struct {
+	Client *hyperliquid.Client
+}
+
+func (r hyperliquidFillReader) Fills(symbol string, orderID string) ([]runtime.FillSnapshot, error) {
+	rows, err := r.Client.GetUserFills()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]runtime.FillSnapshot, 0, len(rows))
+	for _, row := range rows {
+		if symbol != "" && row.Coin != "" && !strings.EqualFold(row.Coin, symbol) {
+			continue
+		}
+		rowOrderID := strconv.FormatInt(row.Oid, 10)
+		if orderID != "" && rowOrderID != orderID {
+			continue
+		}
+		out = append(out, runtime.FillSnapshot{
+			Venue:     "hyperliquid",
+			Symbol:    firstNonEmpty(row.Coin, symbol),
+			Side:      firstNonEmpty(row.Side, row.Dir),
+			OrderID:   rowOrderID,
+			FillID:    firstNonEmpty(strconv.FormatInt(row.Tid, 10), row.Hash),
+			Quantity:  parseConsoleFloat(row.Size),
+			Price:     parseConsoleFloat(row.Price),
+			Fee:       parseConsoleFloat(row.Fee),
+			Timestamp: row.Time,
+			Raw:       row,
+		})
+	}
+	return out, nil
+}
+
+type lighterOpenOrderReader struct {
+	Client *lighter.Client
+}
+
+func (r lighterOpenOrderReader) OpenOrders(symbol string) ([]runtime.OrderSnapshot, error) {
+	rows, err := r.Client.GetOpenOrders(symbol)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]runtime.OrderSnapshot, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, runtime.OrderSnapshot{
+			Venue:        "lighter",
+			Symbol:       firstNonEmpty(symbol, lighterSymbolFromMarketID(row.MarketID)),
+			Side:         row.Side,
+			OrderID:      strconv.FormatInt(row.OrderIndex, 10),
+			ClientID:     strconv.FormatInt(row.ClientOrderIndex, 10),
+			Status:       row.Status,
+			OrderType:    row.Type,
+			RequestedQty: parseConsoleFloat(row.InitialBaseAmount),
+			FilledQty:    parseConsoleFloat(row.FilledBaseAmount),
+			Price:        parseConsoleFloat(row.Price),
+			Raw:          row,
+		})
+	}
+	return out, nil
+}
+
+type lighterFillReader struct {
+	Client *lighter.Client
+}
+
+func (r lighterFillReader) Fills(symbol string, orderID string) ([]runtime.FillSnapshot, error) {
+	rows, err := r.Client.GetAccountTrades(symbol, 100)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]runtime.FillSnapshot, 0, len(rows))
+	for _, row := range rows {
+		if orderID != "" && row.AskID != orderID && row.BidID != orderID && row.AskClientID != orderID && row.BidClientID != orderID {
+			continue
+		}
+		out = append(out, runtime.FillSnapshot{
+			Venue:     "lighter",
+			Symbol:    firstNonEmpty(symbol, lighterSymbolFromMarketID(row.MarketID)),
+			Side:      firstNonEmpty(row.Side, row.Type),
+			OrderID:   firstNonEmpty(row.AskID, row.BidID, row.AskClientID, row.BidClientID),
+			FillID:    row.TradeID,
+			Quantity:  parseConsoleFloat(row.Size),
+			Price:     parseConsoleFloat(row.Price),
+			Timestamp: row.Timestamp,
+			Raw:       row,
+		})
+	}
+	return out, nil
+}
+
+func startLiveStreamReconcilers(ctx context.Context, live liveRuntimeWiring, hybrid *runtime.HybridReconciler) {
+	if !envTruthy(os.Getenv("LIVE_ENABLE_WEBSOCKET_RECONCILIATION")) || hybrid == nil {
+		return
+	}
+	if live.Lighter != nil {
+		go func() {
+			err := live.Lighter.StreamAccountState(ctx, func(state lighter.LighterAccountWSState) {
+				hybrid.ApplyStreamEvent(lighterStreamEvent(state))
+			})
+			if err != nil && ctx.Err() == nil {
+				log.Printf("lighter stream reconciliation stopped: %v", err)
+			}
+		}()
+	}
+}
+
+func lighterStreamEvent(state lighter.LighterAccountWSState) runtime.StreamEvent {
+	event := runtime.StreamEvent{Venue: "lighter", Source: runtime.ReconcileSourceWebsocket, Timestamp: time.Now().UTC().UnixMilli(), Raw: state}
+	for _, order := range state.Orders {
+		event.Orders = append(event.Orders, runtime.OrderSnapshot{
+			Venue:        "lighter",
+			Symbol:       lighterSymbolFromMarketID(order.MarketID),
+			Side:         order.Side,
+			OrderID:      strconv.FormatInt(order.OrderIndex, 10),
+			ClientID:     strconv.FormatInt(order.ClientOrderIndex, 10),
+			Status:       order.Status,
+			OrderType:    order.Type,
+			RequestedQty: parseConsoleFloat(order.InitialBaseAmount),
+			FilledQty:    parseConsoleFloat(order.FilledBaseAmount),
+			Price:        parseConsoleFloat(order.Price),
+			Raw:          order,
+		})
+	}
+	for _, trade := range state.Trades {
+		event.Fills = append(event.Fills, runtime.FillSnapshot{
+			Venue:     "lighter",
+			Symbol:    lighterSymbolFromMarketID(trade.MarketID),
+			Side:      firstNonEmpty(trade.Side, trade.Type),
+			OrderID:   firstNonEmpty(trade.AskID, trade.BidID, trade.AskClientID, trade.BidClientID),
+			FillID:    trade.TradeID,
+			Quantity:  parseConsoleFloat(trade.Size),
+			Price:     parseConsoleFloat(trade.Price),
+			Timestamp: trade.Timestamp,
+			Raw:       trade,
+		})
+	}
+	for _, position := range state.Positions {
+		event.Positions = append(event.Positions, runtime.PositionSnapshot{
+			Venue:         "lighter",
+			Symbol:        firstNonEmpty(position.Symbol, lighterSymbolFromMarketID(position.MarketID)),
+			Side:          strings.ToUpper(firstNonEmpty(position.Side, "BOTH")),
+			Quantity:      parseConsoleFloat(position.Position),
+			Entry:         parseConsoleFloat(position.Entry),
+			UnrealizedPnL: parseConsoleFloat(position.PnL),
+			Raw:           position,
+		})
+	}
+	return event
+}
+
+func envTruthy(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return value == "1" || value == "true" || value == "yes" || value == "y" || value == "on"
+}
+
+func liveReviewConfig(cfg paper.Config) paper.Config {
+	root := config.DataPath("live")
+	cfg.StrategyReviewCandidatesPath = filepath.Join(root, "strategy_review_candidates.jsonl")
+	cfg.StrategyReviewRejectionsPath = filepath.Join(root, "strategy_review_rejections.jsonl")
+	cfg.StrategyReviewSelectedPath = filepath.Join(root, "strategy_review_selected.jsonl")
+	cfg.StrategyReviewPositionsPath = filepath.Join(root, "strategy_review_positions.jsonl")
+	cfg.StrategyReviewCyclesPath = filepath.Join(root, "strategy_review_cycles.jsonl")
+	cfg.OpportunityCoveragePath = filepath.Join(root, "opportunity_coverage.json")
+	cfg.OpportunityCoverageByVenuePath = filepath.Join(root, "opportunity_coverage_by_venue.json")
+	cfg.OvernightStrategySummaryJSONPath = filepath.Join(root, "overnight_strategy_summary.json")
+	cfg.OvernightStrategySummaryMarkdownPath = filepath.Join(root, "overnight_strategy_summary.md")
+	cfg.CandidateCoveragePath = filepath.Join(root, "candidate_coverage.json")
+	cfg.CandidateQualitySummaryPath = filepath.Join(root, "candidate_quality_summary.json")
+	cfg.CandidateQualityByVenuePath = filepath.Join(root, "candidate_quality_by_venue.json")
+	cfg.CandidateQualityBySymbolPath = filepath.Join(root, "candidate_quality_by_symbol.json")
+	return cfg
+}
+
+func recordProtectionEvents(cfg paper.Config, candidate paper.Candidate, plan runtime.ProtectionPlan) {
+	reasons := []string{
+		"mode=" + plan.Mode,
+		"reason=" + plan.Reason,
+		fmt.Sprintf("reduceOnly=%t", plan.ReduceOnly),
+	}
+	events := []string{"PROTECTION_MODE_SELECTED"}
+	if plan.StopArmed {
+		events = append(events, "STOP_ARMED")
+	}
+	if plan.TPLadderArmed {
+		events = append(events, "TP_ARMED")
+	}
+	if plan.TrailingArmed {
+		events = append(events, "TRAILING_ARMED")
+	}
+	for _, eventType := range events {
+		_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
+			Timestamp: time.Now().UTC().UnixMilli(),
+			Type:      eventType,
+			Symbol:    candidate.Symbol,
+			Venue:     candidate.Venue,
+			Side:      candidate.Side,
+			Strategy:  candidate.Strategy,
+			Playbook:  candidate.Playbook,
+			Decision:  plan.Mode,
+			Reasons:   reasons,
+		})
+	}
+}
+
+func recordReconcileEvents(cfg paper.Config, candidate paper.Candidate, reconciled runtime.ReconcileResult) {
+	reasons := []string{
+		fmt.Sprintf("status=%s", reconciled.Status),
+		fmt.Sprintf("orderID=%s", reconciled.OrderID),
+	}
+	reasons = append(reasons, reconciled.Mismatches...)
 	_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
 		Timestamp: time.Now().UTC().UnixMilli(),
 		Type:      "RECONCILE_RESULT",
-		Decision:  "system",
-		Reasons:   []string{"live_order_reconciliation_pending"},
+		Symbol:    candidate.Symbol,
+		Venue:     candidate.Venue,
+		Side:      candidate.Side,
+		Strategy:  candidate.Strategy,
+		Playbook:  candidate.Playbook,
+		Decision:  reconciled.Status,
+		Reasons:   reasons,
 	})
-	return summary, nil
+	for _, eventType := range reconciled.Events {
+		_ = paper.AppendEvent(cfg, paper.TelemetryEvent{
+			Timestamp: time.Now().UTC().UnixMilli(),
+			Type:      eventType,
+			Symbol:    candidate.Symbol,
+			Venue:     candidate.Venue,
+			Side:      candidate.Side,
+			Strategy:  candidate.Strategy,
+			Playbook:  candidate.Playbook,
+			Decision:  reconciled.Status,
+			Reasons:   reasons,
+		})
+	}
+}
+
+func writeLiveReconcileArtifacts(root string, rows []runtime.ReconcileResult) error {
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return err
+	}
+	body, err := json.MarshalIndent(rows, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(root, "reconciliation.json"), append(body, '\n'), 0o644); err != nil {
+		return err
+	}
+	var orders []runtime.OrderSnapshot
+	var fills []runtime.FillSnapshot
+	var positions []runtime.PositionSnapshot
+	for _, row := range rows {
+		orders = append(orders, row.Orders...)
+		fills = append(fills, row.Fills...)
+		positions = append(positions, row.Positions...)
+	}
+	if err := writeLiveJSON(root, "orders.json", orders); err != nil {
+		return err
+	}
+	if err := writeLiveJSON(root, "fills.json", fills); err != nil {
+		return err
+	}
+	return writeLiveJSON(root, "positions.json", positions)
+}
+
+func writeLiveJSON(root string, name string, value any) error {
+	body, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(root, name), append(body, '\n'), 0o644)
+}
+
+func printLiveHealth(snapshot runtime.AccountHealthSnapshot) {
+	fmt.Println()
+	fmt.Println("=== LIVE VENUE HEALTH ===")
+	if len(snapshot.Venues) == 0 {
+		fmt.Println("live health: unavailable")
+		return
+	}
+	for _, health := range snapshot.Venues {
+		fmt.Printf("%s healthy=%t accountReady=%t positionSyncReady=%t fillHistoryReady=%t protectionReady=%t available=%.2f\n",
+			health.Venue,
+			health.Healthy,
+			health.AccountReady,
+			health.PositionSyncReady,
+			health.FillHistoryReady,
+			health.ProtectionReady,
+			health.AvailableBalance,
+		)
+		fmt.Printf("  protection=%s mode=%s\n", health.Protection.Reason, protectionModeFromCapabilities(health.Protection))
+		if health.Stream.Venue != "" {
+			fmt.Printf("  stream source=%s connected=%t stale=%t fallback=%t\n",
+				health.Stream.Source, health.Stream.Connected, health.Stream.Stale, health.Stream.PollingFallback)
+		}
+		if len(health.Reasons) > 0 {
+			fmt.Printf("  blocked=%s\n", strings.Join(health.Reasons, "; "))
+		}
+	}
+}
+
+func printVenueStreamStatus(snapshot runtime.AccountHealthSnapshot) {
+	fmt.Println()
+	fmt.Println("=== VENUE STREAM STATUS ===")
+	if len(snapshot.Venues) == 0 {
+		fmt.Println("stream status: unavailable")
+		return
+	}
+	for _, health := range snapshot.Venues {
+		stream := health.Stream
+		if stream.Venue == "" {
+			fmt.Printf("%s stream=unsupported\n", health.Venue)
+			continue
+		}
+		fmt.Printf("%s supported=%t connected=%t stale=%t source=%s pollingFallback=%t required=%t\n",
+			stream.Venue,
+			stream.Supported,
+			stream.Connected,
+			stream.Stale,
+			stream.Source,
+			stream.PollingFallback,
+			stream.RequiresFreshStream,
+		)
+		if stream.Message != "" {
+			fmt.Printf("  %s\n", stream.Message)
+		}
+	}
+}
+
+func printVenueGateStatus(rows []runtime.VenueGateStatus) {
+	fmt.Println()
+	fmt.Println("=== VENUE GATE STATUS ===")
+	if len(rows) == 0 {
+		fmt.Println("venue gates: unavailable")
+		return
+	}
+	for _, row := range rows {
+		fmt.Printf("%s liveAllowed=%t reason=%q streamReady=%t reconciliationReady=%t protectionReady=%t\n",
+			row.Venue, row.LiveAllowed, row.Reason, row.StreamReady, row.ReconciliationReady, row.ProtectionReady)
+	}
+}
+
+func printReconciliationHealth(state runtime.ReconciliationState) {
+	fmt.Println()
+	fmt.Println("=== RECONCILIATION HEALTH ===")
+	if len(state.Streams) == 0 && len(state.Mismatches) == 0 {
+		fmt.Println("reconciliation health: no live reconciliation state")
+		return
+	}
+	for _, stream := range state.Streams {
+		fmt.Printf("venue=%s source=%s connected=%t stale=%t pollingFallback=%t last=%s\n",
+			stream.Venue, stream.Source, stream.Connected, stream.Stale, stream.PollingFallback, firstNonEmpty(stream.LastEventTimeUTC, "unknown"))
+	}
+	byVenue := map[string]int{}
+	for _, mismatch := range state.Mismatches {
+		byVenue[mismatch.Venue]++
+	}
+	if len(byVenue) == 0 {
+		fmt.Println("mismatches=0")
+		return
+	}
+	venues := make([]string, 0, len(byVenue))
+	for venue := range byVenue {
+		venues = append(venues, venue)
+	}
+	sort.Strings(venues)
+	for _, venue := range venues {
+		fmt.Printf("mismatches venue=%s count=%d\n", venue, byVenue[venue])
+	}
+}
+
+func printLiveReconcile(rows []runtime.ReconcileResult) {
+	fmt.Println()
+	fmt.Println("=== LIVE RECONCILIATION ===")
+	if len(rows) == 0 {
+		fmt.Println("reconciliation: no live orders attempted")
+		return
+	}
+	for _, row := range rows {
+		fmt.Printf("venue=%s symbol=%s orderID=%s status=%s orders=%d fills=%d positions=%d mismatches=%d\n",
+			row.Venue, row.Symbol, row.OrderID, row.Status, len(row.Orders), len(row.Fills), len(row.Positions), len(row.Mismatches))
+		for _, mismatch := range row.Mismatches {
+			fmt.Printf("  mismatch=%s\n", mismatch)
+		}
+	}
+}
+
+func protectionModeFromCapabilities(capability runtime.ProtectionCapabilities) string {
+	if capability.NativeStop && capability.NativeTakeProfit {
+		return "native_stop_tp_runtime_trailing"
+	}
+	if capability.RuntimeManagedStop || capability.RuntimeManagedTakeProfit {
+		return "runtime_managed_protection"
+	}
+	return "unsupported"
+}
+
+func lighterSymbolFromMarketID(marketID int64) string {
+	switch marketID {
+	case 0:
+		return "ETH"
+	case 1:
+		return "BTC"
+	default:
+		return strconv.FormatInt(marketID, 10)
+	}
+}
+
+func admissionForConsole(rows map[string]*paper.CandidateAdmissionSummary, venue string) *paper.CandidateAdmissionSummary {
+	venue = strings.ToLower(strings.TrimSpace(venue))
+	if venue == "" {
+		venue = "unknown"
+	}
+	if rows[venue] == nil {
+		rows[venue] = &paper.CandidateAdmissionSummary{Venue: venue}
+	}
+	return rows[venue]
+}
+
+func admissionRowsForConsole(rows map[string]*paper.CandidateAdmissionSummary) []paper.CandidateAdmissionSummary {
+	venues := make([]string, 0, len(rows))
+	for venue := range rows {
+		venues = append(venues, venue)
+	}
+	sort.Strings(venues)
+	out := make([]paper.CandidateAdmissionSummary, 0, len(venues))
+	for _, venue := range venues {
+		out = append(out, *rows[venue])
+	}
+	return out
+}
+
+func liveCoverageFor(rows map[string]*paper.CandidateCoverageRow, entry paper.UniverseEntry) *paper.CandidateCoverageRow {
+	key := strings.ToLower(strings.TrimSpace(entry.Venue)) + ":" + strings.ToUpper(strings.TrimSpace(entry.Symbol))
+	if rows[key] == nil {
+		rows[key] = &paper.CandidateCoverageRow{
+			Venue:           strings.ToLower(strings.TrimSpace(entry.Venue)),
+			Symbol:          strings.ToUpper(strings.TrimSpace(entry.Symbol)),
+			CanonicalSymbol: strings.ToUpper(strings.TrimSpace(entry.CanonicalSymbol)),
+			Major:           isConsoleMajor(entry.CanonicalSymbol),
+			RejectReasons:   map[string]int{},
+		}
+	}
+	return rows[key]
+}
+
+func liveCoverageRows(rows map[string]*paper.CandidateCoverageRow) []paper.CandidateCoverageRow {
+	keys := make([]string, 0, len(rows))
+	for key := range rows {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]paper.CandidateCoverageRow, 0, len(keys))
+	for _, key := range keys {
+		row := *rows[key]
+		if row.Candidates > 0 {
+			row.AverageConfidence = row.ConfidenceSum / float64(row.Candidates)
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+func isConsoleMajor(symbol string) bool {
+	switch strings.ToUpper(strings.TrimSpace(symbol)) {
+	case "BTC", "ETH", "SOL":
+		return true
+	default:
+		return false
+	}
+}
+
+func lighterExecutionEnvReady() bool {
+	prefix := "LIGHTER_MAINNET_"
+	if config.IsTestnet() {
+		prefix = "LIGHTER_TESTNET_"
+	}
+	return os.Getenv(prefix+"ACCOUNT_INDEX") != "" &&
+		os.Getenv(prefix+"API_KEY_INDEX") != "" &&
+		os.Getenv(prefix+"API_PRIVATE_KEY") != ""
+}
+
+func parseConsoleFloat(value string) float64 {
+	parsed, _ := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	return parsed
+}
+
+func firstMapValue(obj map[string]any, names ...string) any {
+	for _, name := range names {
+		if value, ok := obj[name]; ok {
+			return value
+		}
+	}
+	return nil
+}
+
+func stringFromAny(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(typed)
+	case float64:
+		if typed == float64(int64(typed)) {
+			return strconv.FormatInt(int64(typed), 10)
+		}
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	case json.Number:
+		return typed.String()
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", typed))
+	}
 }
 
 func shouldRunFullResearchHarness() bool {
@@ -684,13 +1577,21 @@ func runPaperRuntime() {
 			status.Paper.OpenCount,
 			status.Paper.Equity,
 		)
+		printRankedInPlay(paper.BuildRanking(snapshot.Summary, engine.State), status, snapshot.Summary.StateBlockers.MaxOpenPositions, 15)
+		if engine.Config.OvernightLogMode {
+			printCandidateQuality(snapshot.Summary.CandidateCoverage)
+			printCycleFooter(snapshot.Summary)
+			return
+		}
 		printVenueDiscovery(snapshot.Summary)
 		printQualificationDiagnostics(snapshot.Summary.QualificationDiagnostics)
 		printSelectedUniverse(snapshot.Summary.SelectedUniverse, 20)
+		printQualifiedNotSelected(snapshot.Summary.QualifiedSkipped, 5)
 		printOpenPositions(status.Paper.OpenPositions)
 		printRecentClosed(status.Paper.RecentClosed, 10)
 		printRejectSummary(snapshot.Summary.RejectReasons, 10)
 		printCandidateAdmission(snapshot.Summary.CandidateAdmission)
+		printCandidateQuality(snapshot.Summary.CandidateCoverage)
 		printApprovedBlocked(snapshot.Summary.ApprovedBlocked, 10)
 		printStateBlockers(snapshot.Summary.StateBlockers)
 		printCycleFooter(snapshot.Summary)
@@ -764,6 +1665,73 @@ func printVenueDiscovery(summary paper.RuntimeSummary) {
 	}
 }
 
+func printRankedInPlay(rows []paper.RankingRow, status paper.StatusPayload, maxOpenPositions int, limit int) {
+	if limit <= 0 || limit > len(rows) {
+		limit = len(rows)
+	}
+	fmt.Println()
+	fmt.Printf("[%s] IN-PLAY RANKED\n", sessionLabel(time.Now().UTC()))
+	if len(rows) == 0 {
+		fmt.Println("ranked universe: empty")
+		return
+	}
+	fmt.Println("| # | venue | sym | side | score | state | cand | app | mark | vol24h | note |")
+	for i := 0; i < limit; i++ {
+		row := rows[i]
+		fmt.Printf("| %2d | %-11s | %-12s | %-5s | %5.1f | %-10s | %4d | %3d | %10.6g | %7s | %s |\n",
+			row.Rank,
+			row.Venue,
+			row.Symbol,
+			row.Side,
+			row.Score,
+			row.State,
+			row.Candidates,
+			row.Approved,
+			row.Mark,
+			compactUSD(row.Volume24hUSD),
+			row.RankReason,
+		)
+	}
+	if limit < len(rows) {
+		fmt.Printf("showing %d of %d selected symbols\n", limit, len(rows))
+	}
+	fmt.Printf("PAPER eq=%.2f bal=%.2f pnl=%+.2f day=%+.2f open=%d/%d\n",
+		status.Paper.Equity,
+		status.Paper.Balance,
+		status.Paper.OpenPnL,
+		status.Paper.RealizedToday,
+		status.Paper.OpenCount,
+		maxOpenPositions,
+	)
+}
+
+func compactUSD(value float64) string {
+	switch {
+	case value >= 1_000_000_000:
+		return fmt.Sprintf("%.2fB", value/1_000_000_000)
+	case value >= 1_000_000:
+		return fmt.Sprintf("%.2fM", value/1_000_000)
+	case value >= 1_000:
+		return fmt.Sprintf("%.1fK", value/1_000)
+	case value > 0:
+		return fmt.Sprintf("%.0f", value)
+	default:
+		return "unknown"
+	}
+}
+
+func sessionLabel(now time.Time) string {
+	hour := now.Hour()
+	switch {
+	case hour < 8:
+		return now.Format("15:04:05") + " ASIA_OPEN"
+	case hour < 13:
+		return now.Format("15:04:05") + " EUROPE_OPEN"
+	default:
+		return now.Format("15:04:05") + " US_SESSION"
+	}
+}
+
 func printSelectedUniverse(rows []paper.UniverseEntry, limitPerVenue int) {
 	fmt.Println()
 	fmt.Println("=== SELECTED UNIVERSE ===")
@@ -807,6 +1775,41 @@ func printSelectedUniverse(rows []paper.UniverseEntry, limitPerVenue int) {
 		}
 		if limit < len(venueRows) {
 			fmt.Printf("showing %d of %d selected symbols for %s\n", limit, len(venueRows), venue)
+		}
+	}
+}
+
+func printQualifiedNotSelected(rows []paper.QualifiedNotSelected, limitPerVenue int) {
+	fmt.Println()
+	fmt.Println("=== QUALIFIED BUT NOT SELECTED ===")
+	if len(rows) == 0 {
+		fmt.Println("qualified but not selected: none")
+		return
+	}
+	byVenue := map[string][]paper.QualifiedNotSelected{}
+	var venues []string
+	for _, row := range rows {
+		venue := strings.ToLower(strings.TrimSpace(row.Venue))
+		if _, ok := byVenue[venue]; !ok {
+			venues = append(venues, venue)
+		}
+		byVenue[venue] = append(byVenue[venue], row)
+	}
+	sort.Strings(venues)
+	for _, venue := range venues {
+		venueRows := byVenue[venue]
+		fmt.Printf("%s:\n", venue)
+		limit := limitPerVenue
+		if limit <= 0 || limit > len(venueRows) {
+			limit = len(venueRows)
+		}
+		for i := 0; i < limit; i++ {
+			row := venueRows[i]
+			fmt.Printf("%d. %s canonical=%s rank=%d vol24h=%.0f reason=%s\n",
+				i+1, row.Symbol, row.CanonicalSymbol, row.Rank, row.Volume24hUSD, row.Reason)
+		}
+		if limit < len(venueRows) {
+			fmt.Printf("showing %d of %d qualified skipped symbols for %s\n", limit, len(venueRows), venue)
 		}
 	}
 }
@@ -965,6 +1968,93 @@ func printCandidateAdmission(rows []paper.CandidateAdmissionSummary) {
 			row.RiskRejected,
 		)
 	}
+}
+
+func printCandidateQuality(rows []paper.CandidateCoverageRow) {
+	fmt.Println()
+	fmt.Println("=== CANDIDATE QUALITY ===")
+	if len(rows) == 0 {
+		fmt.Println("candidate quality: none")
+		return
+	}
+	majors := 0
+	nonMajors := 0
+	nonMajorCandidates := 0
+	nonMajorApproved := 0
+	confidenceSum := 0.0
+	nonMajorConfidenceSum := 0.0
+	byVenueCandidates := map[string]int{}
+	for _, row := range rows {
+		byVenueCandidates[row.Venue] += row.Candidates
+		confidenceSum += row.ConfidenceSum
+		if row.Major {
+			majors++
+		} else {
+			nonMajors++
+			nonMajorCandidates += row.Candidates
+			nonMajorApproved += row.Approved
+			nonMajorConfidenceSum += row.ConfidenceSum
+		}
+	}
+	avgConfidence := 0.0
+	if totalCandidates := totalCoverageCandidates(rows); totalCandidates > 0 {
+		avgConfidence = confidenceSum / float64(totalCandidates)
+	}
+	nonMajorAvgConfidence := 0.0
+	if nonMajorCandidates > 0 {
+		nonMajorAvgConfidence = nonMajorConfidenceSum / float64(nonMajorCandidates)
+	}
+	fmt.Printf("symbols=%d majors=%d nonMajors=%d nonMajorCandidates=%d nonMajorApproved=%d avgConfidence=%.3f nonMajorAvgConfidence=%.3f\n",
+		len(rows), majors, nonMajors, nonMajorCandidates, nonMajorApproved, avgConfidence, nonMajorAvgConfidence)
+	venues := make([]string, 0, len(byVenueCandidates))
+	for venue := range byVenueCandidates {
+		venues = append(venues, venue)
+	}
+	sort.Strings(venues)
+	for _, venue := range venues {
+		fmt.Printf("%s candidates=%d\n", venue, byVenueCandidates[venue])
+	}
+}
+
+func totalCoverageCandidates(rows []paper.CandidateCoverageRow) int {
+	total := 0
+	for _, row := range rows {
+		total += row.Candidates
+	}
+	return total
+}
+
+func liveStreamStatus(venue string) runtime.StreamStatus {
+	venue = strings.ToLower(strings.TrimSpace(venue))
+	requireFresh := envTruthy(os.Getenv("LIVE_REQUIRE_WEBSOCKET_RECONCILIATION"))
+	wsEnabled := envTruthy(os.Getenv("LIVE_ENABLE_WEBSOCKET_RECONCILIATION"))
+	status := runtime.StreamStatus{
+		Venue:               venue,
+		Source:              runtime.ReconcileSourcePolling,
+		PollingFallback:     true,
+		RequiresFreshStream: requireFresh,
+		Message:             "polling fallback active",
+	}
+	switch venue {
+	case "aster":
+		status.Supported = true
+		status.Source = runtime.ReconcileSourceHybrid
+		status.Stale = requireFresh && !wsEnabled
+		status.Message = "user data stream supported; polling fallback active"
+	case "hyperliquid":
+		status.Supported = true
+		status.Source = runtime.ReconcileSourceHybrid
+		status.Stale = requireFresh && !wsEnabled
+		status.Message = "order update stream supported; polling fallback active"
+	case "lighter":
+		status.Supported = true
+		status.Source = runtime.ReconcileSourceHybrid
+		status.Stale = requireFresh && !wsEnabled
+		status.Message = "account order/trade/position stream shapes supported; polling fallback active"
+	default:
+		status.Message = "stream unsupported"
+	}
+	return status
 }
 
 func formatUnixMillis(value int64) string {

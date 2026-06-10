@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -123,6 +124,99 @@ func WriteRejectSummaryJSON(cfg Config, reasons map[string]int) error {
 		reasons = map[string]int{}
 	}
 	return writeJSONFile(cfg.RejectSummaryJSONPath, reasons)
+}
+
+func WriteCandidateCoverageJSON(cfg Config, rows []CandidateCoverageRow) error {
+	if rows == nil {
+		rows = []CandidateCoverageRow{}
+	}
+	return writeJSONFile(cfg.CandidateCoveragePath, rows)
+}
+
+func WriteCandidateQualityJSON(cfg Config, rows []CandidateCoverageRow) error {
+	summary, byVenue, bySymbol := BuildCandidateQuality(rows)
+	if err := writeJSONFile(cfg.CandidateQualitySummaryPath, summary); err != nil {
+		return err
+	}
+	if err := writeJSONFile(cfg.CandidateQualityByVenuePath, byVenue); err != nil {
+		return err
+	}
+	return writeJSONFile(cfg.CandidateQualityBySymbolPath, bySymbol)
+}
+
+func BuildCandidateQuality(rows []CandidateCoverageRow) (CandidateQualitySummary, []CandidateQualityGroup, []CandidateQualityGroup) {
+	summary := CandidateQualitySummary{TopNonMajorRejects: map[string]int{}}
+	byVenueMap := map[string]*CandidateQualityGroup{}
+	bySymbolMap := map[string]*CandidateQualityGroup{}
+	confidenceSum := 0.0
+	nonMajorConfidenceSum := 0.0
+	for _, row := range rows {
+		summary.Symbols++
+		if row.Major {
+			summary.MajorSymbols++
+		} else {
+			summary.NonMajorSymbols++
+			summary.NonMajorCandidates += row.Candidates
+			summary.NonMajorApproved += row.Approved
+			for reason, count := range row.RejectReasons {
+				summary.TopNonMajorRejects[reason] += count
+			}
+		}
+		summary.Candidates += row.Candidates
+		summary.Approved += row.Approved
+		summary.Rejected += row.Rejected
+		confidenceSum += row.ConfidenceSum
+		addQualityGroup(byVenueMap, row.Venue, row)
+		addQualityGroup(bySymbolMap, row.Venue+":"+row.Symbol, row)
+		if !row.Major {
+			nonMajorConfidenceSum += row.ConfidenceSum
+		}
+	}
+	if summary.Symbols > 0 {
+		summary.QualifiedToCandidatePct = float64(summary.Candidates) / float64(summary.Symbols) * 100
+	}
+	if summary.Candidates > 0 {
+		summary.CandidateToApprovedPct = float64(summary.Approved) / float64(summary.Candidates) * 100
+		summary.AverageConfidence = confidenceSum / float64(summary.Candidates)
+	}
+	if summary.NonMajorCandidates > 0 {
+		summary.NonMajorAverageConfidence = nonMajorConfidenceSum / float64(summary.NonMajorCandidates)
+	}
+	return summary, qualityGroups(byVenueMap), qualityGroups(bySymbolMap)
+}
+
+func addQualityGroup(groups map[string]*CandidateQualityGroup, key string, row CandidateCoverageRow) {
+	if groups[key] == nil {
+		groups[key] = &CandidateQualityGroup{Key: key, Reasons: map[string]int{}}
+	}
+	group := groups[key]
+	group.Candidates += row.Candidates
+	group.Approved += row.Approved
+	group.Rejected += row.Rejected
+	group.ConfidenceSum += row.ConfidenceSum
+	for reason, count := range row.RejectReasons {
+		group.Reasons[reason] += count
+	}
+}
+
+func qualityGroups(groups map[string]*CandidateQualityGroup) []CandidateQualityGroup {
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]CandidateQualityGroup, 0, len(keys))
+	for _, key := range keys {
+		group := *groups[key]
+		if group.Candidates+group.Rejected > 0 {
+			group.RejectRate = float64(group.Rejected) / float64(group.Candidates+group.Rejected) * 100
+		}
+		if group.Candidates > 0 {
+			group.AverageConfidence = group.ConfidenceSum / float64(group.Candidates)
+		}
+		out = append(out, group)
+	}
+	return out
 }
 
 func writeJSONFile(path string, value any) error {
